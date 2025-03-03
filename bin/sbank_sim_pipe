@@ -108,6 +108,31 @@ class InspinjNode(pipeline.CondorDAGNode):
             self.add_parent(p)
         dag.add_node(self)
 
+class NoIlwdJob(inspiral.InspiralAnalysisJob):
+    def __init__(self, cp, tag_base="ilwdchar"):
+        exec_name = 'ligolw_no_ilwdchar'
+        extension = 'xml'
+        sections = []
+        inspiral.InspiralAnalysisJob.__init__(self,cp,sections,exec_name,extension)
+        self.set_universe("local")
+        self.tag_base = tag_base
+        self.add_condor_cmd('request_memory', '1999')
+        self.add_condor_cmd('request_disk', '1MB')
+        self.set_stdout_file('logs/'+tag_base+'-$(macroid)-$(process).out')
+        self.set_stderr_file('logs/'+tag_base+'-$(macroid)-$(process).err')
+        if cp.has_section("accounting"):
+            self.add_condor_cmd('accounting_group', cp.get("accounting", "accounting-group"))
+
+
+class NoIlwdNode(pipeline.CondorDAGNode):
+    def __init__(self, job, dag, injs, p_node=[]):
+        pipeline.CondorDAGNode.__init__(self,job)
+        self.add_file_arg(injs)
+        #self.add_output_file(outputFile)
+        for p in p_node:
+            self.add_parent(p)
+        dag.add_node(self)
+
 class BankSimJob(inspiral.InspiralAnalysisJob):
     def __init__(self, cp, tag_base ="banksim"):
         exec_name = 'sbank_sim'
@@ -302,6 +327,7 @@ cp.read(options.config_file)
 
 # CREATE TOP LEVEL DAG AND JOBS
 dag = bank_DAG(options.user_tag)
+NoIlwdJob = NoIlwdJob(cp)
 banksimJob = BankSimJob(cp)
 plotsimJob = PlotSimJob(cp)
 
@@ -340,8 +366,10 @@ for inj_run in cp.options("injections"):
         cp.remove_option('inspinj',opt)
     cp.read(options.config_file)
 
+    # add noilwd node
     # add sim nodes
     inj_name, = inj_node.get_output_files()
+    noilwd_node = NoIlwdNode(NoIlwdJob, dag, inj_name, [inj_node])
     waveform = cp.get(inj_run, "waveform")
     sim_nodes = []
     for j in range(njobs):
