@@ -42,7 +42,7 @@ def log_path():
     host = socket.getfqdn()
     username = getpass.getuser()
     #FIXME add more hosts as you need them
-    if 'caltech.edu' in host: return '/local/' + username
+    if 'caltech.edu' in host: return '/usr1/' + username
     if 'phys.uwm.edu' in host: return '/localscratch/' + username
     if 'aei.uni-hannover.de' in host: return '/local/user/' + username
     if 'phy.syr.edu' in host: return '/usr1/' + username
