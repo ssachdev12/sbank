@@ -41,7 +41,7 @@ from sbank.psds import noise_models, read_psd
 class ContentHandler(ligolw.LIGOLWContentHandler):
     pass
 
-def ligolw_table_to_array(tab):
+def ligolw_table_to_array_sims(tab):
     # get mapping of LIGO_LW types to numpy numeric types; add string types
     from ligo.lw.types import ToNumPyType
     type_map = ToNumPyType.copy()
@@ -50,10 +50,50 @@ def ligolw_table_to_array(tab):
 
     # construct numpy dtype and row accessor
     name_type_pairs = tab.validcolumns.items()
-    name_type_pairs.sort()
+    name_type_pairs = sorted(name_type_pairs)
+    names_list = []
+    for n, _ in name_type_pairs:
+        if n == "process:process_id":
+            names_list.append("process_id")
+        elif n == "event_id":
+            names_list.append("simulation_id")
+        else:
+            names_list.append(n)
     dtype = np.dtype({
-        "names": [n for n, _ in name_type_pairs],
-        "formats": [type_map[t] for _, t in name_type_pairs]})
+        "names": names_list,
+        "formats": [type_map[t] for n, t in name_type_pairs]})
+    extract_in_order = attrgetter(*dtype.names)
+
+    # populate array
+    arr = np.empty(len(tab), dtype=dtype)
+    for i, row in enumerate(tab):
+        arr[i] = extract_in_order(row)
+
+    return arr
+
+def ligolw_table_to_array_tmplts(tab):
+    # get mapping of LIGO_LW types to numpy numeric types; add string types
+    from ligo.lw.types import ToNumPyType
+    type_map = ToNumPyType.copy()
+    type_map[u"ilwd:char"] = "S40"
+    type_map[u"lstring"] = "S32"
+
+    # construct numpy dtype and row accessor
+    name_type_pairs = tab.validcolumns.items()
+    name_type_pairs = sorted(name_type_pairs)
+    names_list = []
+    for n, _ in name_type_pairs:
+        if n == "process:process_id":
+            pass
+        elif n == "event_id":
+            pass
+        elif n == "search":
+            pass
+        else:
+            names_list.append(n)
+    dtype = np.dtype({
+        "names": names_list,
+        "formats": [type_map[t] for n, t in name_type_pairs if n not in ["event_id", "process_id", "search"]]})
     extract_in_order = attrgetter(*dtype.names)
 
     # populate array
@@ -94,6 +134,7 @@ def parse_command_line():
     parser.add_option("--reference-psd", help="Read PSD from xml instead of using analytical noise model.")
     parser.add_option("--instrument", metavar="IFO", help="Specify the instrument for which to generate a template bank.")
     parser.add_option("--flow",default = 40.0, type="float")
+    parser.add_option("--fhigh-max", type="float", default=None, help="If given, generate waveforms and compute matches only to this frequency. The number will be rounded up to the nearest power of 2.")
     parser.add_option("--verbose",default = False, action="store_true")
     parser.add_option("--use-gpu-match", default=False, action="store_true",
         help="Perform match calculations using the first available GPU")
@@ -114,6 +155,16 @@ opts, args = parse_command_line()
 if opts.reference_psd is not None:
     psd = read_psd(opts.reference_psd)[opts.instrument]
     f_orig = psd.f0 + np.arange(len(psd.data.data)) * psd.deltaF
+    f_max_orig = max(f_orig)
+    if opts.fhigh_max:
+        if opts.fhigh_max > f_max_orig:
+            print("Warning: requested fhigh-max (%.3f Hz) exceeds limits of PSD (%.3f Hz). Using PSD limit instead!" \
+                    % (opts.fhigh_max, f_max_orig), file=sys.stderr)
+            opts.fhigh_max = float(f_max_orig)
+    else:
+        print("Warning: fhigh-max not specified, using maximum frequency in the PSD (%.3f Hz)" \
+                % f_max_orig, file=sys.stderr)
+        opts.fhigh_max = float(f_max_orig)
     interpolator = UnivariateSpline(f_orig, np.log(psd.data.data), s=0)
     noise_model = lambda g: np.exp(interpolator(g))
 else:
@@ -134,7 +185,7 @@ if opts.use_gpu_match:
 # initialize output doc; real hdf5 output file and virtual xml file for metadata
 fake_xmldoc = ligolw.Document()
 fake_xmldoc.appendChild(ligolw.LIGO_LW())
-opts_dict = dict((k, v) for k, v in opts.__dict__.iteritems() if v is not False and v is not None)
+opts_dict = dict((k, v) for k, v in opts.__dict__.items() if v is not False and v is not None)
 #process = ligolw_process.register_to_xmldoc(fake_xmldoc, "sbank_sim", FIXME
 #    opts_dict, version=git_version.tag or git_version.id, FIXME
 #    cvs_repository="sbank", cvs_entry_time=git_version.date) FIXME
@@ -146,7 +197,7 @@ process = ligolw_process.register_to_xmldoc(fake_xmldoc, "sbank_sim",
 #
 # initialize the bank
 #
-bank = Bank(noise_model, flow, use_metric=False, cache_waveforms=opts.cache_waveforms, nhood_size=opts.neighborhood_size, nhood_param=opts.neighborhood_param)
+bank = Bank(noise_model, flow, use_metric=False, cache_waveforms=opts.cache_waveforms, nhood_size=opts.neighborhood_size, nhood_param=opts.neighborhood_param, fhigh_max=opts.fhigh_max)
 for file_approx in opts.template_bank:
 
     # if no approximant specified, take from opts.template_approx
@@ -211,7 +262,7 @@ if verbose:
 # main worker loop
 # FIXME: this (potentially) breaks using mixed template bank approximants
 match_map = np.empty(len(sims), dtype=[("match", np.float32), ("inj_sigmasq", np.float32)])
-inj_bank = Bank(noise_model, flow)
+inj_bank = Bank(noise_model, flow, fhigh_max=opts.fhigh_max)
 tmplts = lsctables.SnglInspiralTable()
 for j, sim in enumerate(sims):
 
@@ -237,8 +288,8 @@ if verbose:
 
 # write out results
 h5file = H5File("%s.h5" % usertag, "w")
-h5file.create_dataset("/sim_inspiral", data=ligolw_table_to_array(sims), compression='gzip', compression_opts=1)
-h5file.create_dataset("/sngl_inspiral", data=ligolw_table_to_array(tmplts), compression='gzip', compression_opts=1)
+h5file.create_dataset("/sim_inspiral", data=ligolw_table_to_array_sims(sims), compression='gzip', compression_opts=1)
+h5file.create_dataset("/sngl_inspiral", data=ligolw_table_to_array_tmplts(tmplts), compression='gzip', compression_opts=1)
 h5file.create_dataset("/match_map", data=match_map, compression='gzip', compression_opts=1)
 h5file.flush()
 
@@ -254,7 +305,7 @@ proc = lsctables.ProcessTable.get_table(fake_xmldoc)
 for p in proc:
     p.cvs_entry_time = 0
     p.end_time = 0
-h5file.create_dataset("/process", data=ligolw_table_to_array(proc))
+h5file.create_dataset("/process", data=ligolw_table_to_array_sims(proc))
 pp = lsctables.ProcessParamsTable.get_table(fake_xmldoc)
-h5file.create_dataset("/process_params", data=ligolw_table_to_array(pp))
+h5file.create_dataset("/process_params", data=ligolw_table_to_array_sims(pp))
 h5file.close()
