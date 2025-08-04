@@ -376,7 +376,7 @@ for inj_run in cp.options("injections"):
 
         tag = "%05d" % j
         sim_name = "SBANK_SIM_%s_%s_%05d" % (options.user_tag, inj_run.upper(), j)
-        sim_nodes.append(BankSimNode(banksimJob, dag, inj_name, waveform, j*injperjob, (j+1)*injperjob, sim_name, [inj_node]))
+        sim_nodes.append(BankSimNode(banksimJob, dag, inj_name, waveform, j*injperjob, (j+1)*injperjob, sim_name, [noilwd_node]))
 
     # merge and plot the partial sims
     sim_names = [node.get_output_files()[0] for node in sim_nodes]
