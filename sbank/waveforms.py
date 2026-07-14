@@ -843,14 +843,22 @@ class TaylorF2TidalTemplate(TidalAlignedSpinTemplate):
 
     def _get_f_final(self):
         f_isco = self._get_isco_f_final()
-        if self.tidal_ffinal_mode == "isco" or self.lambda1 < 1 or self.lambda2 < 1:
+        if (self.tidal_ffinal_mode == "isco" or
+                (self.lambda1 < 1 and self.lambda2 < 1)):
             return f_isco
-        compactness1 = (0.371 - 0.0391 * np.log(self.lambda1)
-                        + 0.001056 * np.log(self.lambda1)**2)
-        compactness2 = (0.371 - 0.0391 * np.log(self.lambda2)
-                        + 0.001056 * np.log(self.lambda2)**2)
-        radius1 = G_SI * self.m1 * MSUN_SI / (compactness1 * C_SI**2)
-        radius2 = G_SI * self.m2 * MSUN_SI / (compactness2 * C_SI**2)
+
+        def radius(mass, deformability):
+            if deformability < 1:
+                # Point-particle limit: use the Schwarzschild radius for this
+                # body while retaining the companion's finite tidal radius.
+                return 2 * G_SI * mass * MSUN_SI / C_SI**2
+            log_lambda = np.log(deformability)
+            compactness = (0.371 - 0.0391 * log_lambda
+                           + 0.001056 * log_lambda**2)
+            return G_SI * mass * MSUN_SI / (compactness * C_SI**2)
+
+        radius1 = radius(self.m1, self.lambda1)
+        radius2 = radius(self.m2, self.lambda2)
         f_contact = np.sqrt(G_SI * (self.m1 + self.m2) * MSUN_SI /
                             (radius1 + radius2)**3) / PI
         return min(f_isco, f_contact)
@@ -1295,6 +1303,119 @@ class IMRPhenomPv2Template(IMRPrecessingSpinTemplate):
     approximant = "IMRPhenomPv2"
 
 
+class IMRPhenomXHMTemplate(IMRPrecessingSpinTemplate):
+    """Injection-only aligned-spin IMRPhenomXHM higher-mode waveform.
+
+    The generic precessing container is used to retain detector orientation
+    and orbital phase; transverse spins must be zero for this aligned model.
+    This class is not intended for template-bank placement.
+    """
+    approximant = "IMRPhenomXHM"
+
+
+class IMRPhenomXPHMTemplate(IMRPrecessingSpinTemplate):
+    """Injection-only precessing higher-mode IMRPhenomXPHM waveform.
+
+    This class is not intended for template-bank placement.
+    """
+    approximant = "IMRPhenomXPHM"
+
+
+class IMRPhenomXO4aTemplate(IMRPrecessingSpinTemplate):
+    """Injection-only O4-tuned precessing higher-mode campaign waveform.
+
+    This class is not intended for template-bank placement.
+    """
+    approximant = "IMRPhenomXO4a"
+
+
+class IMRPhenomXPNRTidalv2Template(IMRPrecessingSpinTemplate):
+    """Injection-only precessing IMRPhenomXP_NRTidalv2 NSBH waveform.
+
+    Both dimensionless deformabilities are transported even though the
+    heavier BH has Lambda1=0 in the intended NSBH campaign.  This model is
+    restricted to BNS/NSBH-scale Lambda.  NRTidalv2's extreme-Lambda phase
+    extrapolation pathology (WP2) has no validated fast-fail boundary, so
+    empty and non-finite generated-series checks are the authoritative
+    backstops.  This class is not intended for template-bank placement.
+    """
+    approximant = "IMRPhenomXP_NRTidalv2"
+    is_tidal = True
+    __slots__ = ("lambda1", "lambda2")
+    param_names = PrecessingSpinTemplate.param_names + ("lambda1", "lambda2")
+    param_formats = PrecessingSpinTemplate.param_formats + ("%.1f", "%.1f")
+    hdf_dtype = PrecessingSpinTemplate.hdf_dtype + \
+        [('lambda1', float32), ('lambda2', float32)]
+
+    def __init__(self, m1, m2, spin1x, spin1y, spin1z,
+                 spin2x, spin2y, spin2z, theta, phi, iota, psi, orb_phase,
+                 lambda1, lambda2, bank, flow=None, duration=None):
+        self.lambda1 = float(lambda1)
+        self.lambda2 = float(lambda2)
+        super(IMRPhenomXPNRTidalv2Template, self).__init__(
+            m1, m2, spin1x, spin1y, spin1z, spin2x, spin2y, spin2z,
+            theta, phi, iota, psi, orb_phase, bank, flow=flow,
+            duration=duration)
+
+    @classmethod
+    def from_sim(cls, sim, bank):
+        lambda1_col, lambda2_col = bank.tidal_lambda_columns
+        return cls(sim.mass1, sim.mass2, sim.spin1x, sim.spin1y, sim.spin1z,
+                   sim.spin2x, sim.spin2y, sim.spin2z,
+                   np.pi/2 - sim.latitude, sim.longitude, sim.inclination,
+                   sim.polarization, sim.coa_phase,
+                   _sim_parameter(sim, lambda1_col, "--tidal-lambda-columns"),
+                   _sim_parameter(sim, lambda2_col, "--tidal-lambda-columns"),
+                   bank)
+
+    @classmethod
+    def from_sngl(cls, sngl, bank):
+        lambda1_col, lambda2_col = bank.tidal_lambda_columns
+        return cls(sngl.mass1, sngl.mass2, sngl.spin1x, sngl.spin1y,
+                   sngl.spin1z, sngl.spin2x, sngl.spin2y, sngl.spin2z,
+                   sngl.alpha1, sngl.alpha2, sngl.alpha3, sngl.alpha4,
+                   sngl.alpha5, getattr(sngl, lambda1_col, 0.),
+                   getattr(sngl, lambda2_col, 0.), bank)
+
+    def _tidal_laldict(self):
+        lalpars = lal.CreateDict()
+        lalsim.SimInspiralWaveformParamsInsertTidalLambda1(lalpars, self.lambda1)
+        lalsim.SimInspiralWaveformParamsInsertTidalLambda2(lalpars, self.lambda2)
+        return lalpars
+
+    def _compute_waveform_comps(self, df, f_final):
+        approx = lalsim.GetApproximantFromString(self.approximant)
+        hplus_fd, hcross_fd = lalsim.SimInspiralChooseFDWaveform(
+            self.m1*MSUN_SI, self.m2*MSUN_SI,
+            self.spin1x, self.spin1y, self.spin1z,
+            self.spin2x, self.spin2y, self.spin2z,
+            1.e6*PC_SI, self.iota, self.orb_phase, 0., 0., 0.,
+            df, self.flow, f_final, self.flow, self._tidal_laldict(), approx)
+        if hplus_fd.data.length == 0 or hcross_fd.data.length == 0:
+            raise ValueError("%s returned an empty waveform for Lambda=(%g, %g)" %
+                             (self.approximant, self.lambda1, self.lambda2))
+        if (not np.isfinite(hplus_fd.data.data).all() or
+                not np.isfinite(hcross_fd.data.data).all()):
+            raise ValueError("%s returned a non-finite waveform for Lambda=(%g, %g)" %
+                             (self.approximant, self.lambda1, self.lambda2))
+        return hplus_fd, hcross_fd
+
+    def to_sngl(self):
+        row = super(IMRPhenomXPNRTidalv2Template, self).to_sngl()
+        row.alpha = self.lambda1
+        # alpha1 is already used by the legacy precessing orientation schema;
+        # storage/HDF transport supplies an unambiguous Lambda2 dataset.
+        return row
+
+    def to_storage_arr(self):
+        row = np.zeros(1, dtype=self.hdf_dtype)
+        base = super(IMRPhenomXPNRTidalv2Template, self).to_storage_arr()
+        for name in base.dtype.names:
+            row[name] = base[name]
+        row['lambda1'], row['lambda2'] = self.lambda1, self.lambda2
+        return row
+
+
 class HigherOrderModeTemplate(PrecessingSpinTemplate):
     """Class for higher order mode templates.
 
@@ -1414,6 +1535,10 @@ waveforms = {
     "IMRPhenomD": IMRPhenomDTemplate,
     "IMRPhenomP": IMRPhenomPTemplate,
     "IMRPhenomPv2": IMRPhenomPv2Template,
+    "IMRPhenomXHM": IMRPhenomXHMTemplate,
+    "IMRPhenomXPHM": IMRPhenomXPHMTemplate,
+    "IMRPhenomXO4a": IMRPhenomXO4aTemplate,
+    "IMRPhenomXP_NRTidalv2": IMRPhenomXPNRTidalv2Template,
     "IMRPhenomXAS": IMRPhenomXASTemplate,
     "SEOBNRv2": SEOBNRv2Template,
     "SEOBNRv2_ROM_DoubleSpin": SEOBNRv2ROMDoubleSpinTemplate,
