@@ -62,12 +62,11 @@ def ligolw_table_to_array_sims(tab):
     dtype = np.dtype({
         "names": names_list,
         "formats": [type_map[t] for n, t in name_type_pairs]})
-    extract_in_order = attrgetter(*dtype.names)
-
     # populate array
     arr = np.empty(len(tab), dtype=dtype)
     for i, row in enumerate(tab):
-        arr[i] = extract_in_order(row)
+        arr[i] = tuple(getattr(row, name, "" if dtype[name].kind in "SU" else 0)
+                       for name in dtype.names)
 
     return arr
 
@@ -138,6 +137,11 @@ def parse_command_line():
         help="sim_inspiral columns transporting Lambda1 and Lambda2 (default: alpha:alpha1)")
     parser.add_option("--tidal-ffinal-mode", choices=("contact", "isco"), default="contact",
         help="TaylorF2Tidal termination: physical contact cutoff or legacy ISCO")
+    parser.add_option("--ecc-columns", default="alpha2:alpha3", metavar="COL_E:COL_ANOM",
+        help="sim_inspiral columns transporting eccentricity and mean anomaly; alpha2:alpha3 "
+             "are free transport columns (default: alpha2:alpha3)")
+    parser.add_option("--ecc-f-ref", default=20., type="float", metavar="HZ",
+        help="reference frequency at which eccentricity is defined (default: 20 Hz)")
     parser.add_option("--fhigh-max", type="float", default=None, help="If given, generate waveforms and compute matches only to this frequency. The number will be rounded up to the nearest power of 2.")
     parser.add_option("--verbose",default = False, action="store_true")
     parser.add_option("--use-gpu-match", default=False, action="store_true",
@@ -151,6 +155,11 @@ def parse_command_line():
     columns = opts.tidal_lambda_columns.split(":")
     if len(columns) != 2 or not all(columns):
         parser.error("--tidal-lambda-columns must have the form COL1:COL2")
+    columns = opts.ecc_columns.split(":")
+    if len(columns) != 2 or not all(columns):
+        parser.error("--ecc-columns must have the form COL_E:COL_ANOM")
+    if opts.ecc_f_ref <= 0:
+        parser.error("--ecc-f-ref must be positive")
 
     if opts.reference_psd and not opts.instrument:
         raise ValueError("--instrument is a required option when specifying reference PSD")
@@ -194,6 +203,10 @@ if opts.use_gpu_match:
 fake_xmldoc = ligolw.Document()
 fake_xmldoc.appendChild(ligolw.LIGO_LW())
 opts_dict = dict((k, v) for k, v in opts.__dict__.items() if v is not False and v is not None)
+if not inj_approx.is_eccentric:
+    # Preserve the feature/tidal process-parameter schema for legacy runs.
+    opts_dict.pop("ecc_columns", None)
+    opts_dict.pop("ecc_f_ref", None)
 process = fake_xmldoc.register_process(
     "sbank_sim",
     opts_dict,
@@ -209,7 +222,8 @@ process = fake_xmldoc.register_process(
 bank = Bank(noise_model, flow, use_metric=False, cache_waveforms=opts.cache_waveforms,
             nhood_size=opts.neighborhood_size, nhood_param=opts.neighborhood_param,
             fhigh_max=opts.fhigh_max, tidal_lambda_columns=tuple(opts.tidal_lambda_columns.split(":")),
-            tidal_ffinal_mode=opts.tidal_ffinal_mode)
+            tidal_ffinal_mode=opts.tidal_ffinal_mode,
+            ecc_columns=tuple(opts.ecc_columns.split(":")), ecc_f_ref=opts.ecc_f_ref)
 for file_approx in opts.template_bank:
 
     # if no approximant specified, take from opts.template_approx
@@ -283,7 +297,8 @@ if verbose:
 match_map = np.empty(len(sims), dtype=[("match", np.float32), ("inj_sigmasq", np.float32)])
 inj_bank = Bank(noise_model, flow, fhigh_max=opts.fhigh_max,
                 tidal_lambda_columns=tuple(opts.tidal_lambda_columns.split(":")),
-                tidal_ffinal_mode=opts.tidal_ffinal_mode)
+                tidal_ffinal_mode=opts.tidal_ffinal_mode,
+                ecc_columns=tuple(opts.ecc_columns.split(":")), ecc_f_ref=opts.ecc_f_ref)
 tmplts = lsctables.SnglInspiralTable()
 for j, sim in enumerate(sims):
 
@@ -311,11 +326,23 @@ if verbose:
 h5file = H5File("%s.h5" % usertag, "w")
 sim_array = ligolw_table_to_array_sims(sims)
 h5file.create_dataset("/sim_inspiral", data=sim_array, compression='gzip', compression_opts=1)
-lambda1_col, lambda2_col = opts.tidal_lambda_columns.split(":")
-h5file.create_dataset("/lambda1", data=np.asarray([getattr(s, lambda1_col) for s in sims]),
-                      compression='gzip', compression_opts=1)
-h5file.create_dataset("/lambda2", data=np.asarray([getattr(s, lambda2_col) for s in sims]),
-                      compression='gzip', compression_opts=1)
+if inj_approx.is_tidal:
+    lambda1_col, lambda2_col = opts.tidal_lambda_columns.split(":")
+    h5file.create_dataset("/lambda1", data=np.asarray(
+        [getattr(s, lambda1_col) for s in sims], dtype=np.float32),
+        compression='gzip', compression_opts=1)
+    h5file.create_dataset("/lambda2", data=np.asarray(
+        [getattr(s, lambda2_col) for s in sims], dtype=np.float32),
+        compression='gzip', compression_opts=1)
+if inj_approx.is_eccentric:
+    ecc_col, anomaly_col = opts.ecc_columns.split(":")
+    h5file.create_dataset("/eccentricity", data=np.asarray(
+        [getattr(s, ecc_col) for s in sims], dtype=np.float32),
+        compression='gzip', compression_opts=1)
+    h5file.create_dataset("/mean_anomaly", data=np.asarray(
+        [getattr(s, anomaly_col) for s in sims], dtype=np.float32),
+        compression='gzip', compression_opts=1)
+    h5file.attrs["ecc_f_ref"] = np.float32(opts.ecc_f_ref)
 h5file.create_dataset("/sngl_inspiral", data=ligolw_table_to_array_tmplts(tmplts), compression='gzip', compression_opts=1)
 h5file.create_dataset("/match_map", data=match_map, compression='gzip', compression_opts=1)
 h5file.flush()

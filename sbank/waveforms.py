@@ -34,6 +34,12 @@ from .tau0tau3 import m1m2_to_tau0tau3
 np.seterr(all="ignore")
 _sit_cols = llwsit.validcolumns
 
+try:
+    import pyseobnr  # noqa: F401
+    _HAVE_PYSEOBNR = True
+except ImportError:
+    _HAVE_PYSEOBNR = False
+
 
 class SnglInspiralTable(llwsit):
     def __init__(self, *args, **kwargs):
@@ -58,6 +64,14 @@ def compute_mchirp(m1, m2):
 
 def ceil_pow_2(number):
     return int(2**(np.ceil(np.log2(number))))
+
+
+def _sim_parameter(sim, column, option):
+    """Read a transported sim_inspiral parameter with an actionable error."""
+    if not hasattr(sim, column):
+        raise ValueError("sim_inspiral column %r selected by %s is absent from "
+                         "the injection table" % (column, option))
+    return getattr(sim, column)
 
 
 #
@@ -179,6 +193,8 @@ class AlignedSpinTemplate(object):
       a sim_inspiral object.
     """
     approximant = None
+    is_tidal = False
+    is_eccentric = False
     __slots__ = ("m1", "m2", "spin1z", "spin2z", "chieff", "tau0", "tau0_40", "flow",
                  "_dur", "_mchirp", "_wf", "_metric", "sigmasq",
                  "is_seed_point", "_f_final", "_fhigh_max")
@@ -471,6 +487,7 @@ class TidalAlignedSpinTemplate(AlignedSpinTemplate):
     param_formats = ("%.2f", "%.2f", "%.2f", "%.2f", "%.1f", "%.1f")
     hdf_dtype = AlignedSpinTemplate.hdf_dtype + \
         [('lambda1', float32), ('lambda2', float32)]
+    is_tidal = True
 
     def __init__(self, m1, m2, spin1z, spin2z, lambda1, lambda2, bank,
                  flow=None, duration=None):
@@ -486,12 +503,14 @@ class TidalAlignedSpinTemplate(AlignedSpinTemplate):
     def from_sim(cls, sim, bank):
         lambda1_col, lambda2_col = bank.tidal_lambda_columns
         return cls(sim.mass1, sim.mass2, sim.spin1z, sim.spin2z,
-                   getattr(sim, lambda1_col), getattr(sim, lambda2_col), bank)
+                   _sim_parameter(sim, lambda1_col, "--tidal-lambda-columns"),
+                   _sim_parameter(sim, lambda2_col, "--tidal-lambda-columns"), bank)
 
     @classmethod
     def from_sngl(cls, sngl, bank):
+        lambda1_col, lambda2_col = bank.tidal_lambda_columns
         return cls(sngl.mass1, sngl.mass2, sngl.spin1z, sngl.spin2z,
-                   getattr(sngl, "alpha", 0.), getattr(sngl, "alpha1", 0.), bank)
+                   getattr(sngl, lambda1_col, 0.), getattr(sngl, lambda2_col, 0.), bank)
 
     @classmethod
     def from_dict(cls, params, idx, bank):
@@ -734,6 +753,89 @@ class TaylorF2Template(InspiralAlignedSpinTemplate):
         return hplus_fd
 
 
+class TaylorF2EccTemplate(InspiralAlignedSpinTemplate):
+    """Aligned-spin TaylorF2Ecc inspiral waveform, for injection or banking.
+
+    ``eccentricity`` is defined at ``ecc_f_ref`` (20 Hz by default).  This is
+    the Moore/Favata 3PN, leading O(e^2) model, intended for e <= approximately
+    0.1.  TaylorF2Ecc has no anomaly dependence; ``mean_anomaly`` is retained
+    solely for transport and interoperability with eccentric IMR models.
+    """
+    approximant = "TaylorF2Ecc"
+    approx_name = "TaylorF2Ecc"
+    is_eccentric = True
+    __slots__ = ("eccentricity", "mean_anomaly", "ecc_f_ref")
+    param_names = ("m1", "m2", "spin1z", "spin2z", "eccentricity", "mean_anomaly")
+    param_formats = ("%.2f", "%.2f", "%.2f", "%.2f", "%.4f", "%.4f")
+    hdf_dtype = AlignedSpinTemplate.hdf_dtype + \
+        [('eccentricity', float32), ('mean_anomaly', float32)]
+
+    def __init__(self, m1, m2, spin1z, spin2z, eccentricity, mean_anomaly, bank,
+                 flow=None, duration=None):
+        self.eccentricity = float(eccentricity)
+        self.mean_anomaly = float(mean_anomaly)
+        self.ecc_f_ref = float(bank.ecc_f_ref)
+        super(TaylorF2EccTemplate, self).__init__(m1, m2, spin1z, spin2z, bank,
+                                                  flow=flow, duration=duration)
+
+    @classmethod
+    def from_sim(cls, sim, bank):
+        ecc_col, anomaly_col = bank.ecc_columns
+        return cls(sim.mass1, sim.mass2, sim.spin1z, sim.spin2z,
+                   _sim_parameter(sim, ecc_col, "--ecc-columns"),
+                   _sim_parameter(sim, anomaly_col, "--ecc-columns"), bank)
+
+    @classmethod
+    def from_sngl(cls, sngl, bank):
+        ecc_col, anomaly_col = bank.ecc_columns
+        return cls(sngl.mass1, sngl.mass2, sngl.spin1z, sngl.spin2z,
+                   getattr(sngl, ecc_col, 0.), getattr(sngl, anomaly_col, 0.), bank)
+
+    @classmethod
+    def from_dict(cls, params, idx, bank):
+        flow = float(params['f_lower'][idx])
+        duration = float(params['template_duration'][idx])
+        return cls(float(params['mass1'][idx]), float(params['mass2'][idx]),
+                   float(params['spin1z'][idx]), float(params['spin2z'][idx]),
+                   float(params['eccentricity'][idx]) if 'eccentricity' in params else 0.,
+                   float(params['mean_anomaly'][idx]) if 'mean_anomaly' in params else 0.,
+                   bank, flow=flow if flow > 0 else None,
+                   duration=duration if duration > 0 else None)
+
+    def to_sngl(self):
+        row = super(TaylorF2EccTemplate, self).to_sngl()
+        ecc_col, anomaly_col = self._transport_columns
+        setattr(row, ecc_col, self.eccentricity)
+        setattr(row, anomaly_col, self.mean_anomaly)
+        return row
+
+    @property
+    def _transport_columns(self):
+        # The bank is not retained by the base class; sim_inspiral's stable
+        # internal convention is alpha2/alpha3, matching the CLI defaults.
+        return "alpha2", "alpha3"
+
+    def to_storage_arr(self):
+        row = np.zeros(1, dtype=self.hdf_dtype)
+        base = super(TaylorF2EccTemplate, self).to_storage_arr()
+        for name in base.dtype.names:
+            row[name] = base[name]
+        row['eccentricity'] = self.eccentricity
+        row['mean_anomaly'] = self.mean_anomaly
+        return row
+
+    def _compute_waveform(self, df, f_final):
+        approx = lalsim.GetApproximantFromString(self.approx_name)
+        hplus_fd, _ = lalsim.SimInspiralChooseFDWaveform(
+            self.m1*MSUN_SI, self.m2*MSUN_SI, 0., 0., self.spin1z,
+            0., 0., self.spin2z, 1.e6*PC_SI, 0., 0., 0., self.eccentricity,
+            self.mean_anomaly, df, self.flow, f_final, self.ecc_f_ref,
+            lal.CreateDict(), approx)
+        f_max_idx = int(self._get_f_final() / df + 0.999)
+        hplus_fd.data.data[f_max_idx:] = 0
+        return hplus_fd
+
+
 class TaylorF2TidalTemplate(TidalAlignedSpinTemplate):
     """TaylorF2 inspiral waveform with PN tidal phase and a contact cutoff."""
     approximant = "TaylorF2Tidal"
@@ -764,8 +866,96 @@ class TaylorF2TidalTemplate(TidalAlignedSpinTemplate):
         return hplus_fd
 
 
+class TaylorF2EccTidalTemplate(TidalAlignedSpinTemplate):
+    """TaylorF2Ecc with the LAL TaylorF2 tidal phase and contact cutoff.
+
+    LALSimulation was empirically verified to apply the TidalLambda1/2
+    dictionary parameters: at e=0 its output is bin-for-bin identical to
+    tidal TaylorF2.  Eccentricity is defined at ``ecc_f_ref``.
+    """
+    approximant = "TaylorF2EccTidal"
+    approx_name = "TaylorF2Ecc"
+    is_eccentric = True
+    __slots__ = ("eccentricity", "mean_anomaly", "ecc_f_ref")
+    param_names = ("m1", "m2", "spin1z", "spin2z", "lambda1", "lambda2",
+                   "eccentricity", "mean_anomaly")
+    param_formats = ("%.2f", "%.2f", "%.2f", "%.2f", "%.1f", "%.1f",
+                     "%.4f", "%.4f")
+    hdf_dtype = TidalAlignedSpinTemplate.hdf_dtype + \
+        [('eccentricity', float32), ('mean_anomaly', float32)]
+
+    def __init__(self, m1, m2, spin1z, spin2z, lambda1, lambda2,
+                 eccentricity, mean_anomaly, bank, flow=None, duration=None):
+        self.eccentricity = float(eccentricity)
+        self.mean_anomaly = float(mean_anomaly)
+        self.ecc_f_ref = float(bank.ecc_f_ref)
+        super(TaylorF2EccTidalTemplate, self).__init__(
+            m1, m2, spin1z, spin2z, lambda1, lambda2, bank,
+            flow=flow, duration=duration)
+
+    @classmethod
+    def from_sim(cls, sim, bank):
+        l1col, l2col = bank.tidal_lambda_columns
+        ecc_col, anomaly_col = bank.ecc_columns
+        return cls(sim.mass1, sim.mass2, sim.spin1z, sim.spin2z,
+                   _sim_parameter(sim, l1col, "--tidal-lambda-columns"),
+                   _sim_parameter(sim, l2col, "--tidal-lambda-columns"),
+                   _sim_parameter(sim, ecc_col, "--ecc-columns"),
+                   _sim_parameter(sim, anomaly_col, "--ecc-columns"), bank)
+
+    @classmethod
+    def from_sngl(cls, sngl, bank):
+        l1col, l2col = bank.tidal_lambda_columns
+        ecc_col, anomaly_col = bank.ecc_columns
+        return cls(sngl.mass1, sngl.mass2, sngl.spin1z, sngl.spin2z,
+                   getattr(sngl, l1col, 0.), getattr(sngl, l2col, 0.),
+                   getattr(sngl, ecc_col, 0.), getattr(sngl, anomaly_col, 0.), bank)
+
+    @classmethod
+    def from_dict(cls, params, idx, bank):
+        flow, duration = float(params['f_lower'][idx]), float(params['template_duration'][idx])
+        get = lambda name: float(params[name][idx]) if name in params else 0.
+        return cls(get('mass1'), get('mass2'), get('spin1z'), get('spin2z'),
+                   get('lambda1'), get('lambda2'), get('eccentricity'),
+                   get('mean_anomaly'), bank, flow=flow if flow > 0 else None,
+                   duration=duration if duration > 0 else None)
+
+    def to_sngl(self):
+        row = super(TaylorF2EccTidalTemplate, self).to_sngl()
+        row.alpha2, row.alpha3 = self.eccentricity, self.mean_anomaly
+        return row
+
+    def to_storage_arr(self):
+        row = np.zeros(1, dtype=self.hdf_dtype)
+        base = super(TaylorF2EccTidalTemplate, self).to_storage_arr()
+        for name in base.dtype.names:
+            row[name] = base[name]
+        row['eccentricity'], row['mean_anomaly'] = self.eccentricity, self.mean_anomaly
+        return row
+
+    def _get_f_final(self):
+        return TaylorF2TidalTemplate._get_f_final(self)
+
+    def _compute_waveform(self, df, f_final):
+        approx = lalsim.GetApproximantFromString(self.approx_name)
+        hplus_fd, _ = lalsim.SimInspiralChooseFDWaveform(
+            self.m1*MSUN_SI, self.m2*MSUN_SI, 0., 0., self.spin1z,
+            0., 0., self.spin2z, 1.e6*PC_SI, 0., 0., 0., self.eccentricity,
+            self.mean_anomaly, df, self.flow, f_final, self.ecc_f_ref,
+            self._tidal_laldict(), approx)
+        hplus_fd.data.data[int(self._get_f_final() / df + 0.999):] = 0
+        return hplus_fd
+
+
 class NRTidalAlignedSpinTemplate(TidalAlignedSpinTemplate, IMRAlignedSpinTemplate):
-    """Base for NR-calibrated aligned-spin IMR tidal injection waveforms."""
+    """Base for NR-calibrated aligned-spin IMR tidal injection waveforms.
+
+    NRTidalv3's measured NaN onset is kappa2T ~= 74,350--74,460 at q=1
+    (mass-scale invariant from 0.2+0.2 to 1.4+1.4 Msun), 68,151 at q=1.4,
+    and 102,345 at q=2.  The 60,000 fast-fail threshold is about 12 percent
+    below the smallest measured onset over q in [1, 2.5].  The generated
+    series checks below remain authoritative backstops.
+    """
 
     def _get_f_final(self):
         return IMRAlignedSpinTemplate._get_f_final(self)
@@ -774,10 +964,12 @@ class NRTidalAlignedSpinTemplate(TidalAlignedSpinTemplate, IMRAlignedSpinTemplat
         return self._get_imr_dur()
 
     def _compute_waveform(self, df, f_final):
-        if self.approximant == "IMRPhenomXAS_NRTidalv3" and \
-                max(self.lambda1, self.lambda2) >= 1.e6:
-            raise ValueError("IMRPhenomXAS_NRTidalv3 does not support Lambda >= 1e6; "
-                             "LALSimulation returns an empty waveform")
+        if self.approximant == "IMRPhenomXAS_NRTidalv3":
+            kappa2t = lalsim.SimNRTunedTidesComputeKappa2T(
+                self.m1*MSUN_SI, self.m2*MSUN_SI, self.lambda1, self.lambda2)
+            if kappa2t > 6.e4:
+                raise ValueError("IMRPhenomXAS_NRTidalv3 kappa2T=%g exceeds the safe "
+                                 "limit 60000; waveform generation would risk NaNs" % kappa2t)
         approx = lalsim.GetApproximantFromString(self.approximant)
         hplus_fd, _ = lalsim.SimInspiralChooseFDWaveform(
             self.m1*MSUN_SI, self.m2*MSUN_SI, 0., 0., self.spin1z,
@@ -785,6 +977,9 @@ class NRTidalAlignedSpinTemplate(TidalAlignedSpinTemplate, IMRAlignedSpinTemplat
             df, self.flow, f_final, self.flow, self._tidal_laldict(), approx)
         if hplus_fd.data.length == 0:
             raise ValueError("%s returned an empty waveform for Lambda=(%g, %g)" %
+                             (self.approximant, self.lambda1, self.lambda2))
+        if not np.isfinite(hplus_fd.data.data).all():
+            raise ValueError("%s returned a non-finite waveform for Lambda=(%g, %g)" %
                              (self.approximant, self.lambda1, self.lambda2))
         return hplus_fd
 
@@ -1147,10 +1342,71 @@ class EOBNRHigherOrderModePhaseMaxTemplate(IMRPrecessingSpinTemplate):
     approximant = "EOBNRv2HM_ROM"
 
 
+if _HAVE_PYSEOBNR:
+    class SEOBNRv5EHMTemplate(TaylorF2EccTemplate, IMRAlignedSpinTemplate):
+        """Injection-only aligned-spin eccentric SEOBNRv5EHM waveform.
+
+        Generation uses the gwsignal/pyseobnr interface.  This class is not
+        intended for placement or use as a template-bank approximant.
+        """
+        approximant = "SEOBNRv5EHM"
+
+        def _get_f_final(self):
+            return IMRAlignedSpinTemplate._get_f_final(self)
+
+        def _get_dur(self):
+            return self._get_imr_dur()
+
+        def _compute_waveform(self, df, f_final):
+            import astropy.units as u
+            from lalsimulation.gwsignal.core.waveform import GenerateFDWaveform
+            from lalsimulation.gwsignal.models import gwsignal_get_waveform_generator
+            generator = gwsignal_get_waveform_generator("SEOBNRv5EHM")
+            params = {
+                "mass1": self.m1*u.solMass, "mass2": self.m2*u.solMass,
+                "spin1x": 0.*u.dimensionless_unscaled,
+                "spin1y": 0.*u.dimensionless_unscaled,
+                "spin1z": self.spin1z*u.dimensionless_unscaled,
+                "spin2x": 0.*u.dimensionless_unscaled,
+                "spin2y": 0.*u.dimensionless_unscaled,
+                "spin2z": self.spin2z*u.dimensionless_unscaled,
+                "deltaF": df*u.Hz, "f22_start": self.flow*u.Hz,
+                "f22_ref": self.ecc_f_ref*u.Hz, "f_max": f_final*u.Hz,
+                "deltaT": (1./4096.)*u.s, "condition": 1,
+                "distance": 1.e6*u.pc, "inclination": 0.*u.rad,
+                "phi_ref": 0.*u.rad,
+                "eccentricity": self.eccentricity*u.dimensionless_unscaled,
+                "meanPerAno": self.mean_anomaly*u.rad,
+            }
+            hp, _ = GenerateFDWaveform(params, generator)
+            values = np.asarray(getattr(hp, "value", hp), dtype=np.complex128)
+            out = lal.CreateCOMPLEX16FrequencySeries(
+                "SEOBNRv5EHM", lal.LIGOTimeGPS(0), 0., df,
+                lal.DimensionlessUnit, len(values))
+            out.data.data[:] = values
+            return out
+else:
+    class SEOBNRv5EHMTemplate(object):
+        """Unavailable injection-only stub for the optional pyseobnr model."""
+        approximant = "SEOBNRv5EHM"
+        is_eccentric = True
+        is_tidal = False
+
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("SEOBNRv5EHM requires pyseobnr (container env)")
+
+        @classmethod
+        def from_sim(cls, sim, bank):
+            return cls()
+
+
 waveforms = {
     "TaylorF2RedSpin": TaylorF2RedSpinTemplate,
     "TaylorF2": TaylorF2Template,
     "TaylorF2Tidal": TaylorF2TidalTemplate,
+    "TaylorF2Ecc": TaylorF2EccTemplate,
+    "TaylorF2EccTidal": TaylorF2EccTidalTemplate,
+    "SEOBNRv5EHM": SEOBNRv5EHMTemplate,
     "IMRPhenomD_NRTidalv2": IMRPhenomDNRTidalv2Template,
     "IMRPhenomXAS_NRTidalv3": IMRPhenomXASNRTidalv3Template,
     "IMRPhenomB": IMRPhenomBTemplate,
