@@ -23,7 +23,7 @@ import numpy as np
 from numpy import float32
 import lal
 import lalsimulation as lalsim
-from lal import MSUN_SI, MTSUN_SI, PC_SI, PI
+from lal import C_SI, G_SI, MSUN_SI, MTSUN_SI, PC_SI, PI
 from lal import CreateREAL8Vector, CreateCOMPLEX8FrequencySeries
 from igwn_ligolw.lsctables import SnglInspiralTable as llwsit
 
@@ -464,6 +464,71 @@ class InspiralAlignedSpinTemplate(AlignedSpinTemplate):
         return self._get_isco_f_final()
 
 
+class TidalAlignedSpinTemplate(AlignedSpinTemplate):
+    """Base for aligned-spin waveforms with dimensionless tidal deformabilities."""
+    __slots__ = ("chired", "lambda1", "lambda2", "tidal_ffinal_mode")
+    param_names = ("m1", "m2", "spin1z", "spin2z", "lambda1", "lambda2")
+    param_formats = ("%.2f", "%.2f", "%.2f", "%.2f", "%.1f", "%.1f")
+    hdf_dtype = AlignedSpinTemplate.hdf_dtype + \
+        [('lambda1', float32), ('lambda2', float32)]
+
+    def __init__(self, m1, m2, spin1z, spin2z, lambda1, lambda2, bank,
+                 flow=None, duration=None):
+        self.lambda1 = float(lambda1)
+        self.lambda2 = float(lambda2)
+        self.tidal_ffinal_mode = bank.tidal_ffinal_mode
+        self.chired = lalsim.SimInspiralTaylorF2ReducedSpinComputeChi(
+            m1, m2, spin1z, spin2z)
+        AlignedSpinTemplate.__init__(self, m1, m2, spin1z, spin2z, bank,
+                                     flow=flow, duration=duration)
+
+    @classmethod
+    def from_sim(cls, sim, bank):
+        lambda1_col, lambda2_col = bank.tidal_lambda_columns
+        return cls(sim.mass1, sim.mass2, sim.spin1z, sim.spin2z,
+                   getattr(sim, lambda1_col), getattr(sim, lambda2_col), bank)
+
+    @classmethod
+    def from_sngl(cls, sngl, bank):
+        return cls(sngl.mass1, sngl.mass2, sngl.spin1z, sngl.spin2z,
+                   getattr(sngl, "alpha", 0.), getattr(sngl, "alpha1", 0.), bank)
+
+    @classmethod
+    def from_dict(cls, params, idx, bank):
+        flow = float(params['f_lower'][idx])
+        duration = float(params['template_duration'][idx])
+        return cls(float(params['mass1'][idx]), float(params['mass2'][idx]),
+                   float(params['spin1z'][idx]), float(params['spin2z'][idx]),
+                   float(params['lambda1'][idx]) if 'lambda1' in params else 0.,
+                   float(params['lambda2'][idx]) if 'lambda2' in params else 0.,
+                   bank, flow=flow if flow > 0 else None,
+                   duration=duration if duration > 0 else None)
+
+    def to_sngl(self):
+        row = super(TidalAlignedSpinTemplate, self).to_sngl()
+        row.alpha = self.lambda1
+        row.alpha1 = self.lambda2
+        return row
+
+    def to_storage_arr(self):
+        row = np.zeros(1, dtype=self.hdf_dtype)
+        base = super(TidalAlignedSpinTemplate, self).to_storage_arr()
+        for name in base.dtype.names:
+            row[name] = base[name]
+        row['lambda1'] = self.lambda1
+        row['lambda2'] = self.lambda2
+        return row
+
+    def _get_dur(self):
+        return self._get_chirp_dur()
+
+    def _tidal_laldict(self):
+        lalpars = lal.CreateDict()
+        lalsim.SimInspiralWaveformParamsInsertTidalLambda1(lalpars, self.lambda1)
+        lalsim.SimInspiralWaveformParamsInsertTidalLambda2(lalpars, self.lambda2)
+        return lalpars
+
+
 class IMRPhenomBTemplate(IMRAlignedSpinTemplate):
     approximant = "IMRPhenomB"
     param_names = ("m1", "m2", "chieff")
@@ -667,6 +732,71 @@ class TaylorF2Template(InspiralAlignedSpinTemplate):
         hplus_fd.data.data[f_max_idx:] = 0
 
         return hplus_fd
+
+
+class TaylorF2TidalTemplate(TidalAlignedSpinTemplate):
+    """TaylorF2 inspiral waveform with PN tidal phase and a contact cutoff."""
+    approximant = "TaylorF2Tidal"
+    approx_name = "TaylorF2"
+
+    def _get_f_final(self):
+        f_isco = self._get_isco_f_final()
+        if self.tidal_ffinal_mode == "isco" or self.lambda1 < 1 or self.lambda2 < 1:
+            return f_isco
+        compactness1 = (0.371 - 0.0391 * np.log(self.lambda1)
+                        + 0.001056 * np.log(self.lambda1)**2)
+        compactness2 = (0.371 - 0.0391 * np.log(self.lambda2)
+                        + 0.001056 * np.log(self.lambda2)**2)
+        radius1 = G_SI * self.m1 * MSUN_SI / (compactness1 * C_SI**2)
+        radius2 = G_SI * self.m2 * MSUN_SI / (compactness2 * C_SI**2)
+        f_contact = np.sqrt(G_SI * (self.m1 + self.m2) * MSUN_SI /
+                            (radius1 + radius2)**3) / PI
+        return min(f_isco, f_contact)
+
+    def _compute_waveform(self, df, f_final):
+        approx = lalsim.GetApproximantFromString(self.approx_name)
+        hplus_fd, _ = lalsim.SimInspiralChooseFDWaveform(
+            self.m1*MSUN_SI, self.m2*MSUN_SI, 0., 0., self.spin1z,
+            0., 0., self.spin2z, 1.e6*PC_SI, 0., 0., 0., 0., 0.,
+            df, self.flow, f_final, self.flow, self._tidal_laldict(), approx)
+        f_max_idx = int(self._get_f_final() / df + 0.999)
+        hplus_fd.data.data[f_max_idx:] = 0
+        return hplus_fd
+
+
+class NRTidalAlignedSpinTemplate(TidalAlignedSpinTemplate, IMRAlignedSpinTemplate):
+    """Base for NR-calibrated aligned-spin IMR tidal injection waveforms."""
+
+    def _get_f_final(self):
+        return IMRAlignedSpinTemplate._get_f_final(self)
+
+    def _get_dur(self):
+        return self._get_imr_dur()
+
+    def _compute_waveform(self, df, f_final):
+        if self.approximant == "IMRPhenomXAS_NRTidalv3" and \
+                max(self.lambda1, self.lambda2) >= 1.e6:
+            raise ValueError("IMRPhenomXAS_NRTidalv3 does not support Lambda >= 1e6; "
+                             "LALSimulation returns an empty waveform")
+        approx = lalsim.GetApproximantFromString(self.approximant)
+        hplus_fd, _ = lalsim.SimInspiralChooseFDWaveform(
+            self.m1*MSUN_SI, self.m2*MSUN_SI, 0., 0., self.spin1z,
+            0., 0., self.spin2z, 1.e6*PC_SI, 0., 0., 0., 0., 0.,
+            df, self.flow, f_final, self.flow, self._tidal_laldict(), approx)
+        if hplus_fd.data.length == 0:
+            raise ValueError("%s returned an empty waveform for Lambda=(%g, %g)" %
+                             (self.approximant, self.lambda1, self.lambda2))
+        return hplus_fd
+
+
+class IMRPhenomDNRTidalv2Template(NRTidalAlignedSpinTemplate):
+    """BNS-scale, NR-calibrated IMRPhenomD_NRTidalv2 tidal waveform."""
+    approximant = "IMRPhenomD_NRTidalv2"
+
+
+class IMRPhenomXASNRTidalv3Template(NRTidalAlignedSpinTemplate):
+    """BNS-scale NRTidalv3 waveform; it is empty for Lambda around 1e6 (WP2)."""
+    approximant = "IMRPhenomXAS_NRTidalv3"
 
 
 class PrecessingSpinTemplate(AlignedSpinTemplate):
@@ -1020,6 +1150,9 @@ class EOBNRHigherOrderModePhaseMaxTemplate(IMRPrecessingSpinTemplate):
 waveforms = {
     "TaylorF2RedSpin": TaylorF2RedSpinTemplate,
     "TaylorF2": TaylorF2Template,
+    "TaylorF2Tidal": TaylorF2TidalTemplate,
+    "IMRPhenomD_NRTidalv2": IMRPhenomDNRTidalv2Template,
+    "IMRPhenomXAS_NRTidalv3": IMRPhenomXASNRTidalv3Template,
     "IMRPhenomB": IMRPhenomBTemplate,
     "IMRPhenomC": IMRPhenomCTemplate,
     "IMRPhenomD": IMRPhenomDTemplate,

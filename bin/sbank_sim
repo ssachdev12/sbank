@@ -23,6 +23,7 @@ from operator import attrgetter
 from optparse import OptionParser
 
 from time import strftime
+import sys
 import numpy as np
 from h5py import File as H5File
 
@@ -133,6 +134,10 @@ def parse_command_line():
     parser.add_option("--reference-psd", help="Read PSD from xml instead of using analytical noise model.")
     parser.add_option("--instrument", metavar="IFO", help="Specify the instrument for which to generate a template bank.")
     parser.add_option("--flow",default = 40.0, type="float")
+    parser.add_option("--tidal-lambda-columns", default="alpha:alpha1", metavar="COL1:COL2",
+        help="sim_inspiral columns transporting Lambda1 and Lambda2 (default: alpha:alpha1)")
+    parser.add_option("--tidal-ffinal-mode", choices=("contact", "isco"), default="contact",
+        help="TaylorF2Tidal termination: physical contact cutoff or legacy ISCO")
     parser.add_option("--fhigh-max", type="float", default=None, help="If given, generate waveforms and compute matches only to this frequency. The number will be rounded up to the nearest power of 2.")
     parser.add_option("--verbose",default = False, action="store_true")
     parser.add_option("--use-gpu-match", default=False, action="store_true",
@@ -142,6 +147,10 @@ def parse_command_line():
     parser.add_option("--neighborhood-param", default="tau0", choices=["tau0", "dur"], help="Choose how the neighborhood is sorted for match calculations.")
 
     opts, args = parser.parse_args()
+
+    columns = opts.tidal_lambda_columns.split(":")
+    if len(columns) != 2 or not all(columns):
+        parser.error("--tidal-lambda-columns must have the form COL1:COL2")
 
     if opts.reference_psd and not opts.instrument:
         raise ValueError("--instrument is a required option when specifying reference PSD")
@@ -197,7 +206,10 @@ process = fake_xmldoc.register_process(
 #
 # initialize the bank
 #
-bank = Bank(noise_model, flow, use_metric=False, cache_waveforms=opts.cache_waveforms, nhood_size=opts.neighborhood_size, nhood_param=opts.neighborhood_param, fhigh_max=opts.fhigh_max)
+bank = Bank(noise_model, flow, use_metric=False, cache_waveforms=opts.cache_waveforms,
+            nhood_size=opts.neighborhood_size, nhood_param=opts.neighborhood_param,
+            fhigh_max=opts.fhigh_max, tidal_lambda_columns=tuple(opts.tidal_lambda_columns.split(":")),
+            tidal_ffinal_mode=opts.tidal_ffinal_mode)
 for file_approx in opts.template_bank:
 
     # if no approximant specified, take from opts.template_approx
@@ -209,15 +221,22 @@ for file_approx in opts.template_bank:
         seed_file, approx = file_approx.split(":")
 
     # add templates to bank
-    tmpdoc = ligolw_utils.load_filename(seed_file, contenthandler=ContentHandler)
-    sngl_inspiral = lsctables.SnglInspiralTable.get_table(tmpdoc)
-    seed_waveform = waveforms[approx]
-    bank.add_from_sngls(sngl_inspiral, seed_waveform)
+    if seed_file.endswith((".h5", ".hdf", ".hdf5")):
+        with H5File(seed_file, "r") as hdf_fp:
+            bank.add_from_hdf(hdf_fp)
+        sngl_inspiral = bank._templates
+        tmpdoc = None
+    else:
+        tmpdoc = ligolw_utils.load_filename(seed_file, contenthandler=ContentHandler)
+        sngl_inspiral = lsctables.SnglInspiralTable.get_table(tmpdoc)
+        seed_waveform = waveforms[approx]
+        bank.add_from_sngls(sngl_inspiral, seed_waveform)
 
     if opts.verbose:
         print("Added %d %s templates from %s to bank." % (len(sngl_inspiral), approx, seed_file))
 
-    tmpdoc.unlink()
+    if tmpdoc is not None:
+        tmpdoc.unlink()
     del sngl_inspiral, tmpdoc
 
 if opts.verbose:
@@ -262,7 +281,9 @@ if verbose:
 # main worker loop
 # FIXME: this (potentially) breaks using mixed template bank approximants
 match_map = np.empty(len(sims), dtype=[("match", np.float32), ("inj_sigmasq", np.float32)])
-inj_bank = Bank(noise_model, flow, fhigh_max=opts.fhigh_max)
+inj_bank = Bank(noise_model, flow, fhigh_max=opts.fhigh_max,
+                tidal_lambda_columns=tuple(opts.tidal_lambda_columns.split(":")),
+                tidal_ffinal_mode=opts.tidal_ffinal_mode)
 tmplts = lsctables.SnglInspiralTable()
 for j, sim in enumerate(sims):
 
@@ -288,7 +309,13 @@ if verbose:
 
 # write out results
 h5file = H5File("%s.h5" % usertag, "w")
-h5file.create_dataset("/sim_inspiral", data=ligolw_table_to_array_sims(sims), compression='gzip', compression_opts=1)
+sim_array = ligolw_table_to_array_sims(sims)
+h5file.create_dataset("/sim_inspiral", data=sim_array, compression='gzip', compression_opts=1)
+lambda1_col, lambda2_col = opts.tidal_lambda_columns.split(":")
+h5file.create_dataset("/lambda1", data=np.asarray([getattr(s, lambda1_col) for s in sims]),
+                      compression='gzip', compression_opts=1)
+h5file.create_dataset("/lambda2", data=np.asarray([getattr(s, lambda2_col) for s in sims]),
+                      compression='gzip', compression_opts=1)
 h5file.create_dataset("/sngl_inspiral", data=ligolw_table_to_array_tmplts(tmplts), compression='gzip', compression_opts=1)
 h5file.create_dataset("/match_map", data=match_map, compression='gzip', compression_opts=1)
 h5file.flush()
