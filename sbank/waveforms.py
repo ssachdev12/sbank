@@ -837,7 +837,20 @@ class TaylorF2EccTemplate(InspiralAlignedSpinTemplate):
 
 
 class TaylorF2TidalTemplate(TidalAlignedSpinTemplate):
-    """TaylorF2 inspiral waveform with PN tidal phase and a contact cutoff."""
+    """TaylorF2 inspiral waveform with PN tidal phase and external cutoff.
+
+    ``disruption`` (the default) terminates at the earliest of Schwarzschild
+    ISCO, surface contact, and Eggleton rigid-Roche overflow.  ``contact``
+    retains the pre-WP6 contact/ISCO rule and ``isco`` is the legacy rule.
+    Representative disruption cutoffs are 596 Hz for 4+0.2 Msun,
+    Lambda2=1e6, and 1512 Hz for 0.5+0.2 Msun, Lambda2=1e5 (versus contact
+    cutoffs 2481 and 6088 Hz and ISCO cutoffs 1047 and 6282 Hz).
+
+    TODO(campaign prep): validate the rigid-Roche Eggleton approximation
+    against the EOS-consistent disruption treatment of B&B,
+    arXiv:2212.03855.  NRTidal IMR classes deliberately do not use this
+    external cutoff because they carry their own merger taper.
+    """
     approximant = "TaylorF2Tidal"
     approx_name = "TaylorF2"
 
@@ -861,7 +874,27 @@ class TaylorF2TidalTemplate(TidalAlignedSpinTemplate):
         radius2 = radius(self.m2, self.lambda2)
         f_contact = np.sqrt(G_SI * (self.m1 + self.m2) * MSUN_SI /
                             (radius1 + radius2)**3) / PI
-        return min(f_isco, f_contact)
+        if self.tidal_ffinal_mode == "contact":
+            return min(f_isco, f_contact)
+
+        # A finite-size body is the donor.  The largest overflow separation
+        # is encountered first during inspiral; point particles are never
+        # donors even though their Schwarzschild radii enter surface contact.
+        overflow_separations = []
+        for donor_mass, companion_mass, donor_lambda, donor_radius in (
+                (self.m1, self.m2, self.lambda1, radius1),
+                (self.m2, self.m1, self.lambda2, radius2)):
+            if donor_lambda < 1:
+                continue
+            q = donor_mass / companion_mass
+            q13 = q**(1. / 3.)
+            roche_fraction = (0.49 * q13**2 /
+                              (0.6 * q13**2 + np.log1p(q13)))
+            overflow_separations.append(donor_radius / roche_fraction)
+        d_overflow = max(overflow_separations)
+        f_roche = np.sqrt(G_SI * (self.m1 + self.m2) * MSUN_SI /
+                          d_overflow**3) / PI
+        return min(f_isco, f_contact, f_roche)
 
     def _compute_waveform(self, df, f_final):
         approx = lalsim.GetApproximantFromString(self.approx_name)
@@ -875,11 +908,12 @@ class TaylorF2TidalTemplate(TidalAlignedSpinTemplate):
 
 
 class TaylorF2EccTidalTemplate(TidalAlignedSpinTemplate):
-    """TaylorF2Ecc with the LAL TaylorF2 tidal phase and contact cutoff.
+    """TaylorF2Ecc with the LAL TaylorF2 tidal phase and external cutoff.
 
     LALSimulation was empirically verified to apply the TidalLambda1/2
     dictionary parameters: at e=0 its output is bin-for-bin identical to
-    tidal TaylorF2.  Eccentricity is defined at ``ecc_f_ref``.
+    tidal TaylorF2.  Eccentricity is defined at ``ecc_f_ref``.  It shares
+    TaylorF2Tidal's disruption-default/contact/ISCO cutoff modes.
     """
     approximant = "TaylorF2EccTidal"
     approx_name = "TaylorF2Ecc"

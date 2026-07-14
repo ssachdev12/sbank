@@ -135,8 +135,10 @@ def parse_command_line():
     parser.add_option("--flow",default = 40.0, type="float")
     parser.add_option("--tidal-lambda-columns", default="alpha:alpha1", metavar="COL1:COL2",
         help="sim_inspiral columns transporting Lambda1 and Lambda2 (default: alpha:alpha1)")
-    parser.add_option("--tidal-ffinal-mode", choices=("contact", "isco"), default="contact",
-        help="TaylorF2Tidal termination: physical contact cutoff or legacy ISCO")
+    parser.add_option("--tidal-ffinal-mode", choices=("disruption", "contact", "isco"),
+        default="disruption", help="TaylorF2/TaylorF2Ecc tidal termination: earliest "
+        "Roche overflow, contact, or ISCO (disruption; default); contact and ISCO "
+        "retain the pre-WP6 and legacy behaviours. NRTidal IMR families are unaffected")
     parser.add_option("--ecc-columns", default="alpha2:alpha3", metavar="COL_E:COL_ANOM",
         help="sim_inspiral columns transporting eccentricity and mean anomaly; alpha2:alpha3 "
              "are free transport columns (default: alpha2:alpha3)")
