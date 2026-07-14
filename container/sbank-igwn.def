@@ -1,0 +1,108 @@
+Bootstrap: docker
+From: condaforge/miniforge3:latest
+
+# sbank-igwn.def -- WP7 Part C container recipe.
+#
+# Mirrors the LOCALLY VERIFIED env build exactly (.claude-wp/env_build.log,
+# .claude-wp/pyseobnr_install.log) -- this is the tested truth this recipe follows,
+# not a fresh design. See container/README.md for the full rationale, image-size
+# expectations, and the igwn-py311 (no-container, no-pyseobnr) alternative.
+#
+# Every conda-forge package below appears in the verified package list:
+#   python=3.11, python-lalsimulation, python-lalinspiral, python-ligo-lw,
+#   igwn-ligolw, numpy, scipy, h5py, matplotlib, cython, pip, pyseobnr,
+#   lalsimulation-data
+# ONE justified addition beyond that list: c-compiler/cxx-compiler (see README --
+# the local env_build.log build used the host's system clang on macOS; this
+# container's Debian-based miniforge3 base has no system compiler, and
+# `pip install --no-build-isolation .` must compile sbank's sbank.overlap_cpu
+# Cython/C extension and link it against conda-forge's liblal, exactly as
+# env_build.log verified locally once cython + the full lalsuite conda packages
+# were present).
+#
+# pyseobnr comes from conda-forge ONLY. The pip route is verified BROKEN
+# (.claude-wp/pyseobnr_install.log: pygsl_lite needs a `gsl-config` on PATH to
+# build its C extension, which a bare pip install does not provide) -- do not
+# add `pip install pyseobnr` anywhere in this recipe.
+
+%post
+    set -eu
+
+    # WP7 audit item 6 / container/README.md: python-ligo-lw ships the
+    # ligolw_no_ilwdchar executable that bin/sbank_sim_pipe's NoIlwdJob wraps;
+    # igwn-ligolw is what sbank's own Python code imports post-migration
+    # (.claude-wp/WP1_report.md). Both must be installed side by side -- this
+    # mirrors the locally verified env (env_build.log shows both
+    # python-ligo-lw-1.8.3 and igwn-ligolw-2.1.1 installed together) and is
+    # NOT redundant packaging.
+    conda config --system --add channels conda-forge
+    conda config --system --set channel_priority strict
+
+    conda create -y -n sbank-igwn \
+        python=3.11 \
+        python-lalsimulation \
+        python-lalinspiral \
+        python-ligo-lw \
+        igwn-ligolw \
+        numpy \
+        scipy \
+        h5py \
+        matplotlib \
+        cython \
+        pip \
+        pyseobnr \
+        lalsimulation-data \
+        c-compiler \
+        cxx-compiler
+
+    conda clean -y --all
+
+    # sbank checkout is staged into /opt/sbank by the %files section below
+    # (build.sh runs `apptainer build` from the repo root so those source
+    # paths resolve).
+    conda run -n sbank-igwn --no-capture-output \
+        pip install --no-build-isolation /opt/sbank
+
+    mkdir -p /opt/etc
+
+%files
+    bin /opt/sbank/bin
+    sbank /opt/sbank/sbank
+    setup.py /opt/sbank/setup.py
+    setup.cfg /opt/sbank/setup.cfg
+    pyproject.toml /opt/sbank/pyproject.toml
+    MANIFEST.in /opt/sbank/MANIFEST.in
+    COPYING /opt/sbank/COPYING
+    README.md /opt/sbank/README.md
+    requirements.txt /opt/sbank/requirements.txt
+
+%environment
+    export PATH=/opt/conda/envs/sbank-igwn/bin:$PATH
+    # lalsimulation-data ships the ROM/NRTidal HDF5 data files this recipe
+    # includes specifically for NRTidal ROM models on-cluster (WP2_memo.md
+    # section 1: "the minimal pip wheel lacks the large HDF5 waveform-data
+    # files ... works on IGWN" -- this container carries them so it does too).
+    export LAL_DATA_PATH=/opt/conda/envs/sbank-igwn/share/lalsimulation
+
+%runscript
+    exec /opt/conda/envs/sbank-igwn/bin/python "$@"
+
+%labels
+    Author WP7 (sbank IGWN-pool readiness)
+    Recipe.source .claude-wp/env_build.log,.claude-wp/pyseobnr_install.log
+    Purpose "sbank_sim banksim execution on the IGWN pool, incl. SEOBNRv5EHM (pyseobnr)"
+
+%help
+    sbank-igwn.sif -- conda-forge env (python 3.11) with lalsuite's Python
+    bindings, both python-ligo-lw and igwn-ligolw, and pyseobnr, plus this
+    repo's sbank package installed via `pip install --no-build-isolation .`.
+
+    Run a script inside the image:
+        apptainer exec sbank-igwn.sif sbank_sim --help
+        apptainer exec sbank-igwn.sif ligolw_no_ilwdchar --help
+
+    On an IGWN pool submit file, reference via the container attribute (see
+    container/README.md for the full submit-file snippet and the
+    HTCondor container_image / +SingularityImage note); this .sif is not
+    needed for campaigns that don't use SEOBNRv5EHM -- use the native
+    igwn-py311 env instead (see README, "igwn-py311 alternative").

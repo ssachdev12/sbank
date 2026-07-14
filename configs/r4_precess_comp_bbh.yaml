@@ -1,0 +1,83 @@
+# WP7 campaign config template -- R4 precesscompBBH + R4b block
+#
+# Source: F4 campaign sheet, section "R4 -- precesscompBBH". Priority P1.
+# R4b (REV1/referee R2) covers the >45 Msol comparable-mass corner that neither R4
+# nor R2 samples in a rho-controlled way -- modeled here as a second injection block
+# in the same run, per the F4 sheet's own suggestion ("Directory naming: either a
+# fourth section tag inside R4 or a separate precesshighmBBH scenario, whichever fits
+# the job bookkeeping" -- this template uses a second injection block, i.e. a
+# separate F4 "scenario" name precesshighmBBH, which is the cleaner fit for this
+# generator's {scenario}_{bank}/ directory-per-scenario-per-bank contract).
+#
+# APPROXIMANT UPDATE (per .claude-wp/WP7.md / WP2_memo.md section 5, same as R2):
+# uses IMRPhenomXO4a in place of the F4 sheet's IMRPhenomXPHM, per the user's
+# explicit decision recorded in WP7.md ("XO4a primary for precessing").
+#
+# Kill criterion (pre-registered, F4 sheet): if FF_allsky >= 0.95 across the box for
+# chi_p <= 0.9, the subpop-corner claims are dropped in favor of a publishable null.
+
+run:
+  name: precesscompBBH
+  banks: [allsky]
+  apply_no_ilwdchar: true
+  emit_plot: true
+
+injections:
+  - name: precesscompBBH
+    injection_file: "{{INJECTION_FILE_R4}}"
+    approximant: IMRPhenomXO4a
+    n_total: 100000
+    njobs: 5000
+    injections_per_job: 20
+    params:
+      mtotal: {dist: uniform, min: 15.0, max: 60.0, unit: Msun, frame: detector}
+      mass_ratio_q: {dist: uniform, min: 1.0, max: 6.0}
+      spin1_mag: {dist: mixture, components: [
+                    {weight: 0.5, dist: uniform, min: 0.0, max: 0.99},
+                    {weight: 0.5, dist: uniform, min: 0.5, max: 0.9}]}
+      spin2_mag: {dist: uniform, min: 0.0, max: 0.99}
+      tilts: {dist: isotropic}
+    notes: "LVK overlap: BBHsrc-m1-10-20 cell chi_p>0.5: 19,532 injections (chi_p>0.7:
+           5,622, sVT 1.8%) -- dense; lane i/iii claims (chi_eff-only population models
+           + semianalytic users) and the kill-criterion null, not lane-ii."
+
+  - name: precesshighmBBH
+    injection_file: "{{INJECTION_FILE_R4B}}"
+    approximant: IMRPhenomXO4a
+    n_total: 30000
+    njobs: 1500
+    injections_per_job: 20
+    params:
+      mass1: {dist: log-uniform, min: 45.0, max: 100.0, unit: Msun, frame: detector}
+      mass_ratio_q: {dist: uniform, min: 1.0, max: 4.0, note: "m2 = m1/q"}
+      spin1_mag: {dist: mixture, components: [
+                    {weight: 0.5, dist: uniform, min: 0.0, max: 0.99},
+                    {weight: 0.5, dist: uniform, min: 0.5, max: 0.9}]}
+      spin2_mag: {dist: uniform, min: 0.0, max: 0.99}
+      tilts: {dist: isotropic}
+    notes: "R4b (REV1/referee R2): the >45 Msun comparable-mass corner, which R4 tops
+           out below (m1 ~ 51 Msun max) and R2 only covers at q>=4. LVK overlap:
+           chi_p>0.7 corner holds 55,452 injections -- dense, same lane discipline as R4.
+           Precision gates evaluated in this block's own corner, same recipe as R4/R2."
+
+banks:
+  allsky:
+    path: "{{BANK_PATH_ALLSKY}}"
+
+psd:
+  reference_psd: "{{PSD_PATH}}"
+  instrument: L1
+  flow: 15.0
+
+condor:
+  accounting_group: "{{ACCOUNTING_TAG}}"
+  accounting_group_user: "{{ACCOUNTING_USER}}"
+  request_memory: 3999
+  request_disk: "4096MB"
+  request_cpus: 1
+  container_image: "osdf:///{{CONTAINER_OSDF_PATH}}/sbank-igwn.sif"
+  should_transfer_files: true
+
+output:
+  dir: "{{OUTPUT_DIR}}"
+  log_dir: "{{LOG_DIR}}"

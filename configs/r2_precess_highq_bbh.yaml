@@ -1,0 +1,79 @@
+# WP7 campaign config template -- R2 precesshighqBBH
+#
+# Source: F4 campaign sheet, section "R2 -- precesshighqBBH". Priority P0 by
+# value/compute-hour; pairs with R3 (near-free calibration prerequisite for both R2
+# itself and the R5/Gupte bracket).
+#
+# APPROXIMANT UPDATE (per .claude-wp/WP7.md task header / WP2_memo.md section 5):
+# the F4 sheet's own text still says "IMRPhenomXPHM (+5k SEOBNRv5PHM x-check)", but
+# SEOBNRv5PHM is not available (absent from lalsimulation's enum and from
+# sbank/waveforms.py -- no pyseobnr precessing model is registered, only the
+# aligned-spin SEOBNRv5EHM is). Per the user's explicit decision recorded in WP7.md,
+# this template uses IMRPhenomXO4a (O4-tuned precessing+HM Phenom, same-cost upgrade,
+# WP2_memo.md section 0.3/section 5) as the PRIMARY injection approximant, with
+# IMRPhenomXPHM as the 5k cross-check block (taking the role the sheet originally gave
+# SEOBNRv5PHM).
+
+run:
+  name: precesshighqBBH
+  banks: [allsky]   # SSM irrelevant above 3 Msun
+  apply_no_ilwdchar: true
+  emit_plot: true
+
+injections:
+  - name: precesshighqBBH
+    injection_file: "{{INJECTION_FILE_R2_PRIMARY}}"
+    approximant: IMRPhenomXO4a
+    n_total: 100000
+    njobs: 5000
+    injections_per_job: 20
+    params:
+      mass2: {dist: uniform, min: 3.0, max: 15.0, unit: Msun, frame: detector}
+      mass_ratio_q: {dist: uniform, min: 4.0, max: 12.0, note: "m1 = q*m2, redraw if m1 > 140"}
+      spin1_mag: {dist: mixture, components: [
+                    {weight: 0.5, dist: uniform, min: 0.0, max: 0.99},
+                    {weight: 0.5, dist: uniform, min: 0.5, max: 0.9}],
+                  note: "oversamples GWTC-5.0 subpop magnitudes so chi_p in [0.3,0.9] is dense"}
+      spin2_mag: {dist: uniform, min: 0.0, max: 0.99}
+      tilts: {dist: isotropic, note: "cos(tilt) ~ U[-1,1], azimuths uniform"}
+      inclination: {dist: isotropic}
+      sky_polarization: {dist: uniform, note: "random sky location and polarization, recorded"}
+    notes: "LVK search-side overlap is dense here (BBH-mid chi_p bins [0.5,0.7): 54,182;
+           [0.7,1.0): 22,448 injections) -- fully powers the D_BBH/rho_thr refit.
+           Precision gates: held-out kNN RMSE <= 0.04 in (ln Mc, eta, chi_eff, chi_p);
+           bin-mean bias <= 0.005 in chi_p > 0.5."
+
+  - name: highqBBHxchkPHM
+    injection_file: "{{INJECTION_FILE_R2_XCHECK}}"
+    approximant: IMRPhenomXPHM
+    n_total: 5000
+    njobs: 250
+    injections_per_job: 20
+    notes: "Cross-check block, same draw as the primary block. Fallback if sbank lacks
+           XPHM support: IMRPhenomPv2 and quote the ~8% HOM systematic at q>6
+           (Dhurkunde & Nitz 2022) -- not needed here, XPHM is registered in
+           sbank/waveforms.py (WP5)."
+
+banks:
+  allsky:
+    path: "{{BANK_PATH_ALLSKY}}"
+    # BBH-region stellar bank uses IMR templates per its own approximant column;
+    # leave unset here (see R5 template's note for the same rationale).
+
+psd:
+  reference_psd: "{{PSD_PATH}}"
+  instrument: L1
+  flow: 15.0
+
+condor:
+  accounting_group: "{{ACCOUNTING_TAG}}"
+  accounting_group_user: "{{ACCOUNTING_USER}}"
+  request_memory: 3999
+  request_disk: "4096MB"
+  request_cpus: 1
+  container_image: "osdf:///{{CONTAINER_OSDF_PATH}}/sbank-igwn.sif"
+  should_transfer_files: true
+
+output:
+  dir: "{{OUTPUT_DIR}}"
+  log_dir: "{{LOG_DIR}}"

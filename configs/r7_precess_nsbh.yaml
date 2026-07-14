@@ -1,0 +1,59 @@
+# WP7 campaign config template -- R7 precessNSBH
+#
+# Source: F4 campaign sheet, section "R7 -- precessNSBH". Priority P2.
+# Bank: allsky only (SSM requires a component < 1 Msun, not relevant to NSBH).
+# Approximant: IMRPhenomXP_NRTidalv2 (registered in sbank/waveforms.py, WP5) -- a
+# tidal-capable precessing model is mandatory here: per WP2_memo.md section 5,
+# plain IMRPhenomXPHM *errors* if a tidal Lambda is passed to it.
+
+run:
+  name: precessNSBH
+  banks: [allsky]
+  apply_no_ilwdchar: true
+  emit_plot: true
+
+injections:
+  - name: precessNSBH
+    injection_file: "{{INJECTION_FILE_R7}}"
+    approximant: IMRPhenomXP_NRTidalv2
+    n_total: 60000
+    njobs: 3000
+    injections_per_job: 20
+    params:
+      mass2: {dist: uniform, min: 1.0, max: 2.2, unit: Msun, frame: detector, note: "NS component"}
+      mass1: {dist: mixture, components: [
+                {weight: 0.5, dist: uniform, min: 3.0, max: 9.0,
+                 note: "mass-gap/GW230529-like oversample"},
+                {weight: 0.5, dist: uniform, min: 9.0, max: 25.0}],
+              note: "enforce q <= 18 (stay inside the bank's q<=20 coverage)"}
+      spin1_mag: {dist: isotropic, min: 0.0, max: 0.9, note: "BH component"}
+      spin2_mag: {dist: isotropic, min: 0.0, max: 0.05, note: "NS component -- bank NS chi<=0.05 aligned"}
+      lambda2: {note: "NS tidal deformability -- draw per your EOS prior; NOT specified
+                       in the F4 sheet for R7, record whatever prior is used"}
+    notes: "LVK overlap: NSBH chi_p>0.5: 2,198 injections (chi_p>0.7: 643, sVT 5.0%);
+           |chi_eff|>=0.5: 311 -- enough for a coarse D_NSBH refit (2 FF bins). Pairs
+           with Dhurkunde & Nitz's FF-only <=20% precession loss. Pitch: the penalty
+           measurement (D_NSBH), not rates (Harry & Hoy 2026 already occupies rates
+           territory for precessing-NSBH O3)."
+
+banks:
+  allsky:
+    path: "{{BANK_PATH_ALLSKY}}"
+
+psd:
+  reference_psd: "{{PSD_PATH}}"
+  instrument: L1
+  flow: 15.0
+
+condor:
+  accounting_group: "{{ACCOUNTING_TAG}}"
+  accounting_group_user: "{{ACCOUNTING_USER}}"
+  request_memory: 3999
+  request_disk: "4096MB"
+  request_cpus: 1
+  container_image: "osdf:///{{CONTAINER_OSDF_PATH}}/sbank-igwn.sif"
+  should_transfer_files: true
+
+output:
+  dir: "{{OUTPUT_DIR}}"
+  log_dir: "{{LOG_DIR}}"

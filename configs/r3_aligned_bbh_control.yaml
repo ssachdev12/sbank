@@ -1,0 +1,72 @@
+# WP7 campaign config template -- R3 alignedBBHcontrol
+#
+# Source: F4 campaign sheet, section "R3 -- alignedBBHcontrol". Priority P0,
+# near-free; ALWAYS run with R2 (supplies the verified FF>=0.97 aligned reference
+# subset needed to calibrate rho_thr/A for any BBH-region fit, and the R2/R4/R5
+# calibration anchor). This template's pilot job also doubles as R3's own FF>=0.97
+# sanity gate (F4 sheet section 5).
+#
+# Two injection blocks share one N=40,000 total: jobs 0-1499 IMRPhenomXHM (HOM
+# content), jobs 1500-1999 IMRPhenomXAS (isolates the HOM contribution to aligned FF
+# at high q) -- modeled here as two separate injection blocks rather than one block
+# with an internal job-index switch, since bin/sbank_sim takes one --injection-approx
+# per invocation.
+
+run:
+  name: alignedBBHcontrol
+  banks: [allsky]
+  apply_no_ilwdchar: true
+  emit_plot: true
+
+injections:
+  - name: alignedBBHcontrolXHM
+    injection_file: "{{INJECTION_FILE_R3_XHM}}"
+    approximant: IMRPhenomXHM
+    n_total: 30000
+    njobs: 1500
+    injections_per_job: 20
+    params:
+      mass2: {dist: log-uniform, min: 3.0, max: 60.0, unit: Msun, frame: detector}
+      mass_ratio_q: {dist: uniform, min: 1.0, max: 12.0, note: "m1 = q*m2, redraw if m1 > 140"}
+      spins: {dist: mixture, components: [
+                {weight: 0.5, dist: uniform, min: -0.99, max: 0.99,
+                 note: "chi1z, chi2z independent"},
+                {weight: 0.5, dist: uniform, min: -0.99, max: 0.99,
+                 note: "chi1z = chi2z (equal-spin block, populates |chi_eff| up to 0.99)"}]}
+    notes: "Precision gate: mean FF in the |chi_eff| < 0.3, q < 4 block must be >= 0.97
+           (bank design) -- if not, STOP and debug conventions before interpreting
+           R2/R4 (F4 sheet: the sanity gate for the whole BBH program)."
+
+  - name: alignedBBHcontrolXAS
+    injection_file: "{{INJECTION_FILE_R3_XAS}}"
+    approximant: IMRPhenomXAS
+    n_total: 10000
+    njobs: 500
+    injections_per_job: 20
+    params:
+      mass2: {dist: log-uniform, min: 3.0, max: 60.0, unit: Msun, frame: detector}
+      mass_ratio_q: {dist: uniform, min: 1.0, max: 12.0, note: "m1 = q*m2, redraw if m1 > 140"}
+      spins: {dist: same_as, ref: alignedBBHcontrolXHM}
+    notes: "Isolates the HOM contribution to aligned FF at high q (XAS has no HM)."
+
+banks:
+  allsky:
+    path: "{{BANK_PATH_ALLSKY}}"
+
+psd:
+  reference_psd: "{{PSD_PATH}}"
+  instrument: L1
+  flow: 15.0
+
+condor:
+  accounting_group: "{{ACCOUNTING_TAG}}"
+  accounting_group_user: "{{ACCOUNTING_USER}}"
+  request_memory: 3999
+  request_disk: "4096MB"
+  request_cpus: 1
+  container_image: "osdf:///{{CONTAINER_OSDF_PATH}}/sbank-igwn.sif"
+  should_transfer_files: true
+
+output:
+  dir: "{{OUTPUT_DIR}}"
+  log_dir: "{{LOG_DIR}}"

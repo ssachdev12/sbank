@@ -1,0 +1,82 @@
+# WP7 campaign config template -- tidal BNS
+#
+# Existing production campaign shape (CLAUDE.md: "O4 GstLAL BNS template banks
+# (stellar/allsky + sub-solar-mass/SSM)"), not an F4-sheet run -- CLAUDE.md/F4 sheet
+# section 6 explicitly says "No tidal extensions (paper section already complete)"
+# for NEW tidal work, so this template documents the EXISTING tidal-BNS campaign
+# shape for reproducibility / re-run purposes, per WP7.md's own requirement to ship
+# a template for this run type.
+#
+# Large set: TaylorF2Tidal (production baseline, WP2_memo.md section 0.1 -- the only
+# tidal model verified robust at BNS-scale AND subsolar-scale Lambda) against all
+# three banks. Comparison subset: IMRPhenomD_NRTidalv2 (NR-calibrated, BNS-scale-only
+# per WP2_memo.md section 2 table -- valid here because BNS Lambda stays well under
+# NRTidalv2's few-thousand calibration ceiling, unlike the subsolar case), allsky bank
+# only (a smaller cross-check, not a full 3-bank remeasurement).
+#
+# tidal-ffinal-mode is explicit (WP6: default changed to "disruption" -- see
+# .claude-wp/WP6_report.md's reproducibility warning). BNS-scale Lambda rarely reaches
+# the regime where disruption/contact/ISCO diverge much, but stating the mode here
+# keeps this config self-documenting per WP7.md's instruction.
+
+run:
+  name: tidalBNS
+  banks: [allsky, ssm, all]
+  apply_no_ilwdchar: true
+  emit_plot: true
+
+injections:
+  - name: tidalBNS
+    injection_file: "{{INJECTION_FILE_TIDAL_BNS}}"
+    approximant: TaylorF2Tidal
+    n_total: 100000
+    njobs: 5000
+    injections_per_job: 20
+    params:
+      mass1: {dist: uniform, min: 1.0, max: 3.0, unit: Msun, frame: detector}
+      mass2: {dist: uniform, min: 1.0, max: 3.0, unit: Msun, frame: detector}
+      spin1z: {dist: uniform, min: -0.05, max: 0.05}
+      spin2z: {dist: uniform, min: -0.05, max: 0.05}
+      lambda1: {dist: eos_dependent, note: "draw per your EOS prior; BNS-scale (Lambda ~ O(10-5000))"}
+      lambda2: {dist: eos_dependent, note: "draw per your EOS prior; BNS-scale (Lambda ~ O(10-5000))"}
+
+  - name: tidalBNSxchkNRTidalv2
+    banks: [allsky]
+    injection_file: "{{INJECTION_FILE_TIDAL_BNS_XCHECK}}"
+    approximant: IMRPhenomD_NRTidalv2
+    n_total: 5000
+    njobs: 250
+    injections_per_job: 20
+    notes: "NR-calibrated comparison subset, BNS-scale Lambda only (WP2_memo.md
+           section 2: NRTidalv2 'runs, but out of calibration' at subsolar Lambda --
+           do NOT reuse this block's approximant for tidal SUBSOLAR)."
+
+banks:
+  allsky:
+    path: "{{BANK_PATH_ALLSKY}}"
+  ssm:
+    path: "{{BANK_PATH_SSM}}"
+  all:
+    path: "{{BANK_PATH_ALL}}"
+
+psd:
+  reference_psd: "{{PSD_PATH}}"
+  instrument: L1
+  flow: 15.0
+
+tidal:
+  ffinal_mode: disruption   # explicit per WP6's default-change reproducibility warning
+  lambda_columns: "alpha:alpha1"
+
+condor:
+  accounting_group: "{{ACCOUNTING_TAG}}"
+  accounting_group_user: "{{ACCOUNTING_USER}}"
+  request_memory: 3999
+  request_disk: "4096MB"
+  request_cpus: 1
+  container_image: "osdf:///{{CONTAINER_OSDF_PATH}}/sbank-igwn.sif"
+  should_transfer_files: true
+
+output:
+  dir: "{{OUTPUT_DIR}}"
+  log_dir: "{{LOG_DIR}}"

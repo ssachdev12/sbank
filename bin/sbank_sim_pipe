@@ -51,19 +51,25 @@ except ImportError:
 #
 ###############################################################################
 
-def log_path():
-    host = socket.getfqdn()
-    username = getpass.getuser()
-    #FIXME add more hosts as you need them
-    if 'caltech.edu' in host: return '/local/' + username
-    if 'phys.uwm.edu' in host: return '/localscratch/' + username
-    if 'aei.uni-hannover.de' in host: return '/local/user/' + username
-    if 'phy.syr.edu' in host: return '/usr1/' + username
-    else: return tempfile.gettempdir()
+def default_log_dir():
+    """Portable fallback for the condor DAG log directory.
+
+    WP7 audit item 5: this used to be a hardcoded per-host table
+    (caltech.edu/phys.uwm.edu/aei.uni-hannover.de/phy.syr.edu -> a
+    site-specific local-scratch path, else tempfile.gettempdir()). That
+    table doesn't generalize to the IGWN pool (arbitrary submit hosts, not
+    just the four LDG sites it knew about) and silently falls back to
+    tempfile.gettempdir() for everyone else anyway. Replaced by an explicit
+    --log-dir CLI option (see parse_command_line); this function is only the
+    default when --log-dir is not given.
+    """
+    return tempfile.gettempdir()
 
 class bank_DAG(pipeline.CondorDAG):
 
-    def __init__(self, name, logpath = log_path()):
+    def __init__(self, name, logpath=None):
+        if logpath is None:
+            logpath = default_log_dir()
         self.basename = name
         tempfile.tempdir = logpath
         tempfile.template = self.basename + '.dag.log.'
@@ -89,6 +95,185 @@ class bank_DAG(pipeline.CondorDAG):
             f.write(str(c)+"\n")
         f.close()
 
+
+###############################################################################
+#
+# WP7 audit helpers -- IGWN-pool readiness (accounting/resources/transfer/
+# container/retry-policy). Each is an opt-in, ini-driven, generic addition:
+# an ini file with none of these new sections behaves exactly as before.
+# See .claude-wp/WP7_report.md Part A for the full item-by-item audit this
+# implements.
+#
+###############################################################################
+
+def _apply_accounting(job, cp):
+    """accounting_group / accounting_group_user (WP7 audit item 1).
+
+    accounting_group was already supported (via an [accounting] ini
+    section); accounting_group_user was not, even though the sibling
+    bin/sbank_pipe already supports both (see its SBankJob/LWAddJob/
+    SBankChooseMchirpBoundariesJob) -- this makes sbank_sim_pipe match that
+    existing, already-in-repo pattern. IGWN requires accounting_group on
+    every job; accounting_group_user is required only for shared/service
+    accounts.
+    """
+    if cp.has_section("accounting"):
+        if cp.has_option("accounting", "accounting-group"):
+            job.add_condor_cmd('accounting_group', cp.get("accounting", "accounting-group"))
+        if cp.has_option("accounting", "accounting-group-user"):
+            job.add_condor_cmd('accounting_group_user', cp.get("accounting", "accounting-group-user"))
+
+
+def _apply_resources(job, cp, tag, default_memory, default_disk, default_cpus=None):
+    """request_memory / request_disk / request_cpus (WP7 audit item 2).
+
+    Previously hardcoded per job class (1999/3999 MB, 1MB disk, cpus only
+    from the DAG-generation host's OMP_NUM_THREADS env var) with no way to
+    override from the ini. Now overridable per job-type via an optional
+    ini [condor-resources] section (keys "<tag>-memory"/"<tag>-disk"/
+    "<tag>-cpus"); falls back to the historical hardcoded defaults so an
+    ini without this section submits identical jobs to before.
+    """
+    section = "condor-resources"
+    def _opt(name, default):
+        key = "%s-%s" % (tag, name)
+        if cp.has_section(section) and cp.has_option(section, key):
+            return cp.get(section, key)
+        return str(default)
+    job.add_condor_cmd('request_memory', _opt("memory", default_memory))
+    job.add_condor_cmd('request_disk', _opt("disk", default_disk))
+    cpus = None
+    if cp.has_section(section) and cp.has_option(section, "%s-cpus" % tag):
+        cpus = cp.get(section, "%s-cpus" % tag)
+    elif default_cpus is not None:
+        cpus = str(default_cpus)
+    elif "OMP_NUM_THREADS" in os.environ:
+        # Legacy behavior, kept for back-compat: sniffs the DAG-generation
+        # host's OMP_NUM_THREADS. An explicit "<tag>-cpus" ini value (above)
+        # always wins and is the recommended way to set this for IGWN pool
+        # submission, where the generating host's env has no relationship
+        # to the execute node.
+        cpus = os.environ["OMP_NUM_THREADS"]
+    if cpus is not None:
+        job.add_condor_cmd('request_cpus', cpus)
+
+
+def _apply_transfer(job, cp, static_input_files=()):
+    """should_transfer_files / when_to_transfer_output / transfer_input_files
+    (WP7 audit item 3). Off by default (preserves the historical
+    shared-filesystem assumption); opt in with:
+
+        [transfer]
+        should-transfer-files = YES
+        ; when-to-transfer-output = ON_EXIT_OR_EVICT   (default)
+        ; extra-input-files = /path/one,/path/two
+
+    AUDIT FINDING (verified against the installed glue.pipeline source,
+    .venv-test/lib/python3.11/site-packages/glue/pipeline.py):
+    CondorDAGNode.add_input_file()/add_file_opt() only feed
+    transfer_input_files into the submit file for the 'grid' universe --
+    for 'vanilla' (what every job class here uses) they only affect DAG
+    dependency bookkeeping (get_input_files()/get_output_files()), not the
+    written .sub file. So transfer_input_files below is necessarily a
+    JOB-level static list (the reference PSD / template-bank files, which
+    the '# CREATE DAG' campaign loop further down holds constant across
+    every node of a given job class) -- the per-node injection file is NOT
+    included, because a single BankSimJob instance is shared across every
+    injection run (inj_run) in the campaign loop, each with a different
+    injection file, and glue.pipeline's vanilla-universe writer has no
+    per-node (VARS-macro-based) transfer_input_files hook to attach it to.
+    Two ways to run a campaign that actually needs this: (a) a shared
+    filesystem for the injection XML (the unchanged default), or (b) the
+    new bin/sbank_sim_dag_config generator (WP7 Part B), which writes its
+    own DAG/.sub files with per-node VARS macros and handles this
+    correctly. FLAGGED FOR REVIEWER: read from source, not exercised
+    against a live IGWN schedd from this environment (no condor here).
+    """
+    if not (cp.has_section("transfer") and cp.has_option("transfer", "should-transfer-files")
+            and cp.getboolean("transfer", "should-transfer-files")):
+        return
+    job.add_condor_cmd('should_transfer_files', 'YES')
+    when = 'ON_EXIT_OR_EVICT'
+    if cp.has_option("transfer", "when-to-transfer-output"):
+        when = cp.get("transfer", "when-to-transfer-output")
+    job.add_condor_cmd('when_to_transfer_output', when)
+    files = list(static_input_files)
+    if cp.has_option("transfer", "extra-input-files"):
+        files.extend(f.strip() for f in cp.get("transfer", "extra-input-files").split(",") if f.strip())
+    if files:
+        job.add_condor_cmd('transfer_input_files', ','.join(files))
+
+
+def _apply_container(job, cp):
+    """Apptainer/Singularity execution on the IGWN pool (WP7 audit item 4,
+    Part C image). Off by default; opt in with:
+
+        [container]
+        image = osdf:///path/to/sbank-igwn.sif
+
+    Emits both the HTCondor container-universe attribute (`container_image`,
+    documented for osdf:// / cvmfs:// image URLs) and the older
+    `+SingularityImage` classad some pool nodes still key off of, so one ini
+    setting works across a pool mid-migration. SOURCE: HTCondor manual
+    `container_image` submit command + IGWN/OSG container-submission
+    convention as I know it -- NOT verified against a live IGWN submit host
+    from this environment (no condor installed here). FLAGGED FOR REVIEWER:
+    confirm against current computing.docs.ligo.org container guidance
+    before relying on both attributes simultaneously in production.
+
+    getenv hygiene: jobs historically ran with getenv=True (leaks the
+    submit host's full environment into the job -- harmless outside a
+    container on a shared-FS pool, but can shadow a container's own
+    library paths from the inside). When a container image is configured
+    this uses an explicit allowlist (OMP_NUM_THREADS, OPENBLAS_NUM_THREADS
+    -- the two variables this repo's scripts rely on per CLAUDE.md) instead
+    of blanket True.
+    """
+    if not (cp.has_section("container") and cp.has_option("container", "image")):
+        job.add_condor_cmd('getenv', 'True')
+        return
+    image = cp.get("container", "image")
+    job.add_condor_cmd('container_image', image)
+    job.add_condor_cmd('+SingularityImage', '"%s"' % image)
+    job.add_condor_cmd('getenv', 'OMP_NUM_THREADS,OPENBLAS_NUM_THREADS')
+
+
+def _apply_policies(job, cp):
+    """Optional retry-priority/hold-handling passthrough (WP7 audit item 7),
+    ini [policy] section. All opt-in; an ini without this section changes
+    nothing. (DAG-level RETRY is already applied uniformly by
+    bank_DAG.add_node -> node.set_retry(3) for every node; that default is
+    unchanged.)
+    """
+    if not cp.has_section("policy"):
+        return
+    if cp.has_option("policy", "priority"):
+        job.add_condor_cmd('priority', cp.get("policy", "priority"))
+    if cp.has_option("policy", "periodic-release"):
+        job.add_condor_cmd('periodic_release', cp.get("policy", "periodic-release"))
+    if cp.has_option("policy", "periodic-hold"):
+        job.add_condor_cmd('periodic_hold', cp.get("policy", "periodic-hold"))
+    if cp.has_option("policy", "periodic-remove"):
+        job.add_condor_cmd('periodic_remove', cp.get("policy", "periodic-remove"))
+
+
+def _static_banksim_inputs(cp):
+    """Best-effort static input-file list (reference PSD + template-bank
+    paths) read from the [banksim] ini section, for _apply_transfer's
+    job-level transfer_input_files. Generic/ini-driven only -- no
+    site-specific paths hardcoded here.
+    """
+    files = []
+    if cp.has_option("banksim", "reference-psd"):
+        files.append(cp.get("banksim", "reference-psd").strip())
+    if cp.has_option("banksim", "template-bank"):
+        for line in cp.get("banksim", "template-bank").splitlines():
+            line = line.strip()
+            if line:
+                files.append(line.split(":")[0])
+    return files
+
+
 class InspinjJob(InspiralAnalysisJob):
     def __init__(self, cp, tag_base="inspinj"):
         exec_name = 'lalapps_inspinj'
@@ -98,12 +283,11 @@ class InspinjJob(InspiralAnalysisJob):
         self.set_universe("local")
         self.set_sub_file(tag_base+'.sub')
         self.tag_base = tag_base
-        self.add_condor_cmd('request_memory', '1999')
-        self.add_condor_cmd('request_disk', '1MB')
+        _apply_resources(self, cp, "inspinj", 1999, "1MB")
         self.set_stdout_file('logs/'+tag_base+'-$(macroid)-$(process).out')
         self.set_stderr_file('logs/'+tag_base+'-$(macroid)-$(process).err')
-        if cp.has_section("accounting"):
-            self.add_condor_cmd('accounting_group', cp.get("accounting", "accounting-group"))
+        _apply_accounting(self, cp)
+        _apply_policies(self, cp)
 
 
 class InspinjNode(pipeline.CondorDAGNode):
@@ -122,6 +306,20 @@ class InspinjNode(pipeline.CondorDAGNode):
         dag.add_node(self)
 
 class NoIlwdJob(InspiralAnalysisJob):
+    """Strips legacy ilwd:char typing from injection XML via
+    ligolw_no_ilwdchar (WP7 audit item 6). STILL NEEDED post-igwn_ligolw
+    migration -- in fact *more* necessary than before: igwn_ligolw dropped
+    ilwdchar support entirely (see .claude-wp/WP1_report.md, the
+    'Move to igwn_ligolw' upstream merge), so any legacy GstLAL-era
+    injection XML that still carries ilwd:char IDs can no longer be read by
+    this codebase's own igwn_ligolw-based tooling at all without this strip
+    step running first. TOOL AVAILABILITY: ligolw_no_ilwdchar ships with
+    python-ligo-lw, NOT igwn-ligolw -- the two packages must be installed
+    side by side for this job to run (confirmed on the locally verified env
+    in .claude-wp/env_build.log / WP1_report.md, where both were present
+    together; the container recipe in container/sbank-igwn.def installs
+    both for exactly this reason and documents it in container/README.md).
+    """
     def __init__(self, cp, tag_base="ilwdchar"):
         exec_name = 'ligolw_no_ilwdchar'
         extension = 'xml'
@@ -129,12 +327,11 @@ class NoIlwdJob(InspiralAnalysisJob):
         InspiralAnalysisJob.__init__(self,cp,sections,exec_name,extension)
         self.set_universe("local")
         self.tag_base = tag_base
-        self.add_condor_cmd('request_memory', '1999')
-        self.add_condor_cmd('request_disk', '1MB')
+        _apply_resources(self, cp, "ilwdchar", 1999, "1MB")
         self.set_stdout_file('logs/'+tag_base+'-$(macroid)-$(process).out')
         self.set_stderr_file('logs/'+tag_base+'-$(macroid)-$(process).err')
-        if cp.has_section("accounting"):
-            self.add_condor_cmd('accounting_group', cp.get("accounting", "accounting-group"))
+        _apply_accounting(self, cp)
+        _apply_policies(self, cp)
 
 
 class NoIlwdNode(pipeline.CondorDAGNode):
@@ -152,17 +349,21 @@ class BankSimJob(InspiralAnalysisJob):
         extension = 'xml'
         sections = ['banksim']
         InspiralAnalysisJob.__init__(self,cp,sections,exec_name,extension)
-        self.add_condor_cmd('request_memory', '3999')
         self.tag_base = tag_base
-        self.add_condor_cmd('getenv','True')
-        self.add_condor_cmd('request_memory', '3999')
-        self.add_condor_cmd('request_disk', '1MB')
+        # WP7 audit item 2: was `add_condor_cmd('request_memory', '3999')`
+        # called twice (harmless -- condor keeps the last value -- but a
+        # bug); now a single call, overridable per-campaign.
+        _apply_resources(self, cp, "banksim", 3999, "1MB")
         self.set_stdout_file('logs/'+tag_base+'$(macroid)-$(cluster)-$(process).out')
         self.set_stderr_file('logs/'+tag_base+'-$(macroid)-$(cluster)-$(process).err')
-        if cp.has_section("accounting"):
-            self.add_condor_cmd('accounting_group', cp.get("accounting", "accounting-group"))
-        if "OMP_NUM_THREADS" in os.environ:
-            self.add_condor_cmd('request_cpus', os.environ["OMP_NUM_THREADS"])
+        _apply_accounting(self, cp)
+        # WP7 audit item 3/4: transfer + container are the two IGWN-pool
+        # readiness items most specific to this job (it's the one that
+        # actually consumes the PSD/bank/injection files and needs the
+        # sbank_sim executable's environment); item 4 also sets getenv.
+        _apply_transfer(self, cp, static_input_files=_static_banksim_inputs(cp))
+        _apply_container(self, cp)
+        _apply_policies(self, cp)
 
 
 class BankSimNode(pipeline.CondorDAGNode):
@@ -187,16 +388,16 @@ class PlotSimJob(InspiralAnalysisJob):
         sections = []
         InspiralAnalysisJob.__init__(self,cp,sections,exec_name,extension)
         self.tag_base = tag_base
-        self.add_condor_cmd('request_memory', '3999')
-        self.add_condor_cmd('request_disk', '1MB')
+        # WP7 audit item 2: removed the duplicate request_memory call
+        # (originally set twice, same value both times).
+        _apply_resources(self, cp, "plotsim", 3999, "1MB")
         self.set_universe("local")
         self.set_sub_file(tag_base+'.sub')
         self.set_stdout_file('logs/'+tag_base+'-$(macroid)-$(process).out')
         self.set_stderr_file('logs/'+tag_base+'-$(macroid)-$(process).err')
         self.add_condor_cmd('getenv','True')
-        if cp.has_section("accounting"):
-            self.add_condor_cmd('accounting_group', cp.get("accounting", "accounting-group"))
-        self.add_condor_cmd('request_memory', '3999')
+        _apply_accounting(self, cp)
+        _apply_policies(self, cp)
 
 
 class PlotSimNode(pipeline.CondorDAGNode):
@@ -227,6 +428,32 @@ lalapps_inspinj = /usr/bin/lalapps_inspinj
 
 ;[accounting]
 ;accounting-group = ???
+;accounting-group-user = ???             ; only needed for shared/service accounts
+
+; --- WP7 IGWN-pool readiness: all sections below are OPTIONAL and OFF BY
+; DEFAULT. Omitting them reproduces this script's pre-WP7 behavior exactly.
+
+;[condor-resources]                      ; per-job-type request_memory/disk/cpus
+;banksim-memory = 3999
+;banksim-disk = 4096
+;banksim-cpus = 1
+;inspinj-memory = 1999
+;ilwdchar-memory = 1999
+;plotsim-memory = 3999
+
+;[transfer]                              ; non-shared-filesystem (OSG/IGWN pool) execution
+;should-transfer-files = YES
+;when-to-transfer-output = ON_EXIT_OR_EVICT
+;extra-input-files = /path/to/extra1,/path/to/extra2
+
+;[container]                             ; run sbank_sim/sbank_plot_sim inside Apptainer
+;image = osdf:///igwn/.../sbank-igwn.sif  ; see container/sbank-igwn.def
+
+;[policy]                                ; retry/priority/hold passthrough
+;priority = 10
+;periodic-release = (HoldReasonCode == 26)
+;periodic-hold = (JobStatus == 2) && ((CurrentTime - EnteredCurrentStatus) > 86400)
+;periodic-remove = (JobStatus == 5) && ((CurrentTime - EnteredCurrentStatus) > 3600)
 
 [banksim]
 ; This section contains the parameters of the entire bank parameter
@@ -317,6 +544,10 @@ def parse_command_line():
     parser = OptionParser(usage=usage)
     parser.add_option("--config-file", default=None, help="Read options for generating template bank placement pipeline from configuration ini file..")
     parser.add_option("--user-tag", default="SBANK", help="Make your results feel special and give them a unique name.")
+    parser.add_option("--log-dir", default=None, metavar="PATH",
+                       help="Directory for the condor DAG's own log file (WP7 audit item 5: "
+                            "replaces a hardcoded caltech.edu/uwm/aei/syr host table). Defaults "
+                            "to tempfile.gettempdir() (e.g. $TMPDIR) if not given.")
     options, filenames = parser.parse_args()
 
     return options, filenames
@@ -339,7 +570,7 @@ cp = dcConfigParser()
 cp.read(options.config_file)
 
 # CREATE TOP LEVEL DAG AND JOBS
-dag = bank_DAG(options.user_tag)
+dag = bank_DAG(options.user_tag, logpath=options.log_dir)
 NoIlwdJob = NoIlwdJob(cp)
 banksimJob = BankSimJob(cp)
 plotsimJob = PlotSimJob(cp)
