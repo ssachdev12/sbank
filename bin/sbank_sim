@@ -185,7 +185,7 @@ if opts.use_gpu_match:
 fake_xmldoc = ligolw.Document()
 fake_xmldoc.appendChild(ligolw.LIGO_LW())
 opts_dict = dict((k, v) for k, v in opts.__dict__.items() if v is not False and v is not None)
-fake_xmldoc.register_process(
+process = fake_xmldoc.register_process(
     "sbank_sim",
     opts_dict,
     version="no version",
