@@ -39,16 +39,14 @@ master (e13f6ac, untouched)
   │     9c68256  Add tidal template support (WP3): TaylorF2Tidal + NRTidal classes,
   │              contact-frequency cutoff, lambda plumbing  <- feature/tidal tip
   │
-  ├─ feature/eccentric (WP4: eccentric support + WP3 hardening)
-  │     1406654  Add eccentric template support (WP4) + WP3 hardening  <- feature/eccentric tip
-  │
-  ├─ [WP5: Phenom-X precessing/HM + per-body tidal contact cutoff]
+  ├─ feature/eccentric (WP4: eccentric support + WP3 hardening;
+  │                      WP5: Phenom-X precessing/HM + per-body tidal contact cutoff)
+  │     1406654  Add eccentric template support (WP4) + WP3 hardening
   │     be11622  Add Phenom-X precessing/HM injection classes + per-body tidal
-  │              contact cutoff (WP5)  -- committed on top of 1406654, but no branch
-  │              ref named "feature/eccentric" was advanced to it; it is only reachable
-  │              from feature/bank-ingestion/feature/igwn-dag onward. Treat WP5 as
-  │              logically part of the feature/eccentric stack (per WP8's own task
-  │              spec: "feature/eccentric[+WP5]").
+  │              contact cutoff (WP5)  <- feature/eccentric tip
+  │              (WP5 was committed directly on the feature/eccentric ref, per the
+  │              WP5 spec "continue on feature/eccentric"; verified:
+  │              `git rev-parse feature/eccentric` = be11622.)
   │
   ├─ feature/bank-ingestion (WP6: Roche-overflow default cutoff + PyCBC/MBTA ingestion)
   │     fb05169  Roche-overflow default tidal cutoff + multi-bank ingestion (WP6)
@@ -57,8 +55,9 @@ master (e13f6ac, untouched)
   └─ feature/igwn-dag (WP7: DAG generator + campaign configs + container;
                         WP8: preamble fixes + smokes + this document, CURRENT BRANCH)
         5962d01  Add IGWN-pool DAG readiness, campaign config generator, and
-                 Apptainer container (WP7)  <- feature/igwn-dag tip at WP8 start
-        [WP8 changes: see "Commit" in .claude-wp/WP8_report.md for the sha, if any]
+                 Apptainer container (WP7)
+        1a68f2f  Per-bank flow/casing config fixes, integration smokes, READINESS
+                 handoff (WP8)  <- feature/igwn-dag tip
 ```
 
 **Recommended merge order into `master` (or a new integration branch)**: exactly the
@@ -80,8 +79,8 @@ no-op, but doing it in the wrong order first could create spurious conflicts.
 | WP1 | `sync-upstream` @ `6a92e44` | (forensics + merge, no adversarial review) | 3-way fork/upstream merge; fixed the upstream `register_process()` `NameError`; found and documented (not fixed) `master`'s pre-existing `cvs_entry_time` crash. |
 | WP2 | (memo only, no code) | (advisory memo, no review) | Approximant availability/recommendation survey; basis for WP3–WP5's model choices and this document's capability matrix. |
 | WP3 | `feature/tidal` @ `9c68256` | **APPROVE** | `TaylorF2Tidal`, `IMRPhenomD_NRTidalv2`, `IMRPhenomXAS_NRTidalv3`; C-Love contact-frequency cutoff (pre-WP6 default). |
-| WP4 | `feature/eccentric` @ `1406654` | **APPROVE** | `TaylorF2Ecc`, `TaylorF2EccTidal`; conditional `SEOBNRv5EHM` (pyseobnr-gated); NRTidalv3 kappa2T fast-fail. |
-| WP5 | `be11622` (see topology note above) | **APPROVE** | Injection-only `IMRPhenomXHM`/`IMRPhenomXPHM`/`IMRPhenomXO4a`/`IMRPhenomXP_NRTidalv2`; per-body tidal contact cutoff (S4) generalized in `TaylorF2TidalTemplate._get_f_final`. |
+| WP4 | `1406654` (on `feature/eccentric`) | **APPROVE** | `TaylorF2Ecc`, `TaylorF2EccTidal`; conditional `SEOBNRv5EHM` (pyseobnr-gated); NRTidalv3 kappa2T fast-fail. |
+| WP5 | `feature/eccentric` @ `be11622` (branch tip) | **APPROVE** | Injection-only `IMRPhenomXHM`/`IMRPhenomXPHM`/`IMRPhenomXO4a`/`IMRPhenomXP_NRTidalv2`; per-body tidal contact cutoff (S4) generalized in `TaylorF2TidalTemplate._get_f_final`. |
 | WP6 | `feature/bank-ingestion` @ `fb05169` | **REQUEST-CHANGES → resolved** (see §2) | Roche-overflow `disruption` default tidal cutoff (**breaking change, see §2**); `bin/sbank_convert_bank` (strict PyCBC converter, honest MBTA stub). |
 | WP7 | `feature/igwn-dag` @ `5962d01` | **APPROVE** | `bin/sbank_sim_dag_config` (dependency-free YAML→DAGMan generator, no `lalapps`/`glue.pipeline`); 9 `configs/*.yaml` campaign templates; `container/sbank-igwn.def` (not built, lint-checked only — see §5). |
 | WP8 | `feature/igwn-dag` (this work, see `.claude-wp/WP8_report.md`) | (self-implemented, this document) | Per-bank `--flow`/`--fhigh-max` override + historical `SSM`/`ALL` casing fix (WP7 NB-1/NB-2); R7 self-documenting `tidal:` block (NB-4); one real `bin/sbank_sim` integration smoke per new capability (S1–S5); this document. |
