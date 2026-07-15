@@ -1,0 +1,616 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+#
+# Copyright (C) 2026  Surabhi Sachdev
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the
+# Free Software Foundation; either version 2 of the License, or (at your
+# option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General
+# Public License for more details.
+
+"""sbank_sim_dag_config -- WP7 Part B campaign config generator.
+
+Consumes a per-run-type YAML campaign config (see configs/*.yaml) and emits
+a self-contained HTCondor DAGMan workflow (a .dag file plus one .sub file
+per job class) that runs bin/sbank_sim across the campaign's injection
+scenarios and banks, following the job/output layout that
+banksims/recovery/scripts/01_consolidate_banksim.py expects (see the F4
+campaign sheet, read-only reference, listed in .claude-wp/WP7.md).
+
+WHY A NEW GENERATOR (not just fixing bin/sbank_sim_pipe): bin/sbank_sim_pipe
+and bin/sbank_pipe both build their DAG on top of
+`lalapps.inspiral.InspiralAnalysisJob`, which was removed from lalsuite in
+Spring 2025 (see .claude-wp/WP1_report.md) -- neither script can actually
+generate a DAG on any modern IGWN stack (confirmed locally: `InspiralAnalysisJob`
+falls back to a bare `object` and every Job subclass's `__init__` call chain
+breaks). This generator has no dependency on lalapps or glue.pipeline at
+all -- it writes condor submit-language and DAGMan text directly with the
+stdlib plus PyYAML, so it runs anywhere Python 3 + PyYAML does (including
+this sandboxed test environment, with no condor installed).
+
+This also sidesteps a real limitation of glue.pipeline's vanilla-universe
+CondorDAGNode found while auditing bin/sbank_sim_pipe (WP7 Part A, item 3):
+it does not populate a job's `transfer_input_files` from
+add_input_file()/add_file_opt() for anything but the 'grid' universe. Here,
+since each (scenario, bank) pair gets its own dedicated .sub file with the
+per-node injection-min/injection-max/output stem supplied via DAGMan VARS
+macros, `transfer_input_files` can correctly list the (per-job-class-static)
+injection file, template-bank file, and PSD file directly in the submit
+file -- no per-node macro plumbing needed, because within one (scenario,
+bank) pair those three paths are the same for every node.
+
+Usage:
+    sbank_sim_dag_config CONFIG.yaml --output-dir DIR
+        [--allow-placeholders] [--set TOKEN=VALUE ...]
+
+Config schema: see configs/README (embedded below in SCHEMA_HELP) and any
+shipped configs/*.yaml template.
+"""
+
+from __future__ import print_function
+
+import argparse
+import os
+import re
+import sys
+
+try:
+    import yaml
+except ImportError:  # pragma: no cover - PyYAML is a repo-wide dependency
+    sys.stderr.write(
+        "sbank_sim_dag_config requires PyYAML ('pip install pyyaml' / "
+        "conda-forge 'pyyaml').\n")
+    raise
+
+
+PLACEHOLDER_RE = re.compile(r"\{\{[A-Za-z0-9_]+\}\}")
+
+SCHEMA_HELP = """
+Required top-level keys (dotted paths):
+  run.name                          str
+  run.banks                         non-empty list of bank names
+  injections                        non-empty list of injection blocks, each with:
+                                       name, injection_file, approximant,
+                                       n_total, njobs, injections_per_job
+  banks                             dict: every name in run.banks must be a key here,
+                                       each entry needs at least `path`
+  psd.instrument                    str
+  psd.reference_psd OR psd.noise_model   (at least one required)
+  condor.accounting_group           str
+  condor.container_image            str (osdf:// URL on a production config)
+  output.dir                        str
+
+  Per-leg --flow: every (injection block, bank) pair ("leg") needs a resolvable
+  --flow, taken from banks.<name>.flow if set, else the global psd.flow. At
+  least one of the two must be set for each leg actually used, or config
+  validation fails with a clear per-leg error. There is no hardcoded flow
+  convention -- PyCBC/MBTA banks may use their own f_low; set it explicitly
+  per bank rather than relying on a global default meant for a different bank.
+
+Optional (defaults shown):
+  run.apply_no_ilwdchar             true
+  run.emit_plot                     true
+  psd.flow                          (none -- fallback for any bank leg without
+                                       its own banks.<name>.flow; see above)
+  banks.<name>.flow                 (none -- per-bank override of psd.flow,
+                                       emitted verbatim into that bank's --flow)
+  banks.<name>.fhigh_max            (none -- per-bank --fhigh-max override)
+  banks.<name>.tag                  (defaults to the bank's dict key -- display
+                                       casing used in the emitted directory/job/
+                                       file names, e.g. tag: SSM for key ssm, to
+                                       match historical campaign directory casing)
+  condor.accounting_group_user      (none)
+  condor.request_memory             3999
+  condor.request_disk               "4096MB"
+  condor.request_cpus               1
+  condor.should_transfer_files      true
+  condor.extra_input_files          []
+  condor.sbank_sim_executable       "sbank_sim"
+  condor.no_ilwdchar_executable     "ligolw_no_ilwdchar"
+  output.log_dir                    <output.dir>/logs
+  tidal.ffinal_mode / tidal.lambda_columns          (only for tidal runs)
+  eccentric.ecc_columns / eccentric.ecc_f_ref       (only for eccentric runs)
+  injections[].control_block        {job_start, job_end, note}
+  injections[].params               free-form self-documentation (draw distributions)
+  injections[].banks                override run.banks for this block only (e.g. a
+                                       cross-check block that only runs against one bank)
+"""
+
+
+class ConfigError(Exception):
+    """Raised for schema/placeholder problems; message is meant to be
+    printed directly to the user, not a traceback."""
+
+
+# ---------------------------------------------------------------------------
+# YAML loading + placeholder handling
+# ---------------------------------------------------------------------------
+
+def load_raw_text(path):
+    with open(path) as fh:
+        return fh.read()
+
+
+def apply_overrides(text, overrides):
+    """Replace every literal `{{TOKEN}}` in `text` with overrides[TOKEN].
+    Substring-level replacement (not YAML-key based) so a placeholder can
+    sit inside a larger string value (e.g. an osdf:// URL) and still be
+    filled by a single --set.
+    """
+    for token, value in overrides.items():
+        text = text.replace("{{%s}}" % token, value)
+    return text
+
+
+def find_unresolved_placeholders(text):
+    return sorted(set(PLACEHOLDER_RE.findall(text)))
+
+
+def parse_overrides(pairs):
+    overrides = {}
+    for item in pairs or []:
+        if "=" not in item:
+            raise ConfigError(
+                "--set expects TOKEN=VALUE (got %r); TOKEN is the bare name "
+                "inside a config's {{TOKEN}} placeholder, e.g. "
+                "--set BANK_PATH_ALLSKY=/path/to/bank.xml.gz" % item)
+        token, value = item.split("=", 1)
+        overrides[token.strip()] = value
+    return overrides
+
+
+# ---------------------------------------------------------------------------
+# Schema validation
+# ---------------------------------------------------------------------------
+
+def _get(cfg, dotted, default="__MISSING__"):
+    node = cfg
+    for part in dotted.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return default
+        node = node[part]
+    return node
+
+
+_REQUIRED_SCALAR_KEYS = [
+    "run.name",
+    "psd.instrument",
+    "condor.accounting_group",
+    "condor.container_image",
+    "output.dir",
+]
+
+_REQUIRED_INJECTION_KEYS = [
+    "name", "injection_file", "approximant", "n_total", "njobs",
+    "injections_per_job",
+]
+
+
+def validate_schema(cfg):
+    errors = []
+
+    for key in _REQUIRED_SCALAR_KEYS:
+        if _get(cfg, key) == "__MISSING__":
+            errors.append("missing required key '%s'" % key)
+
+    banks_used = _get(cfg, "run.banks")
+    if not banks_used or not isinstance(banks_used, list):
+        errors.append("missing/empty required key 'run.banks' (non-empty list)")
+        banks_used = []
+
+    bank_table = _get(cfg, "banks")
+    if not isinstance(bank_table, dict):
+        errors.append("missing required key 'banks' (dict of bank name -> {path, ...})")
+        bank_table = {}
+    for name in banks_used:
+        if name not in bank_table:
+            errors.append("run.banks refers to bank '%s' but 'banks.%s' is not defined" % (name, name))
+        elif "path" not in bank_table.get(name, {}):
+            errors.append("banks.%s is missing required key 'path'" % name)
+
+    injections = _get(cfg, "injections")
+    if not injections or not isinstance(injections, list):
+        errors.append("missing/empty required key 'injections' (non-empty list)")
+        injections = []
+    seen_names = set()
+    for i, block in enumerate(injections):
+        if not isinstance(block, dict):
+            errors.append("injections[%d] must be a mapping" % i)
+            continue
+        for key in _REQUIRED_INJECTION_KEYS:
+            if key not in block:
+                errors.append("injections[%d] is missing required key '%s'" % (i, key))
+        # Per-block bank override (e.g. R1's cross-check block runs against
+        # the allsky bank only, unlike the primary block's allsky+SSM+ALL) --
+        # optional; falls back to run.banks when absent.
+        block_banks = block.get("banks")
+        if block_banks is not None:
+            if not isinstance(block_banks, list) or not block_banks:
+                errors.append("injections[%d].banks, if given, must be a non-empty list" % i)
+            else:
+                for name in block_banks:
+                    if name not in bank_table:
+                        errors.append(
+                            "injections[%d].banks refers to bank '%s' but 'banks.%s' is not defined"
+                            % (i, name, name))
+        name = block.get("name")
+        if name:
+            if name in seen_names:
+                errors.append("duplicate injections[].name '%s'" % name)
+            seen_names.add(name)
+        njobs = block.get("njobs")
+        ninj = block.get("injections_per_job")
+        ntotal = block.get("n_total")
+        if isinstance(njobs, int) and isinstance(ninj, int) and isinstance(ntotal, int):
+            if njobs * ninj != ntotal:
+                errors.append(
+                    "injections[%d] ('%s'): njobs(%d) * injections_per_job(%d) = %d "
+                    "!= n_total(%d)" % (i, name, njobs, ninj, njobs * ninj, ntotal))
+        control = block.get("control_block")
+        if control is not None:
+            if not isinstance(njobs, int):
+                pass
+            else:
+                job_end = control.get("job_end")
+                job_start = control.get("job_start", 0)
+                if isinstance(job_end, int) and job_end >= njobs:
+                    errors.append(
+                        "injections[%d] ('%s'): control_block.job_end (%d) must be < njobs (%d)"
+                        % (i, name, job_end, njobs))
+                if isinstance(job_start, int) and isinstance(job_end, int) and job_start > job_end:
+                    errors.append(
+                        "injections[%d] ('%s'): control_block.job_start (%d) > job_end (%d)"
+                        % (i, name, job_start, job_end))
+
+    has_psd = _get(cfg, "psd.reference_psd") != "__MISSING__" or _get(cfg, "psd.noise_model") != "__MISSING__"
+    if not has_psd:
+        errors.append("psd section needs at least one of 'reference_psd' or 'noise_model'")
+
+    # Per-bank flow (P1, NB-1): each (injection block, bank) leg needs a
+    # resolvable --flow -- either its own banks.<name>.flow or the global
+    # psd.flow. No convention is hardcoded here (PyCBC/MBTA banks may define
+    # their own f_low); a leg that resolves neither is a clear config error,
+    # not a silent fall-through to some GstLAL-specific default.
+    global_flow = _get(cfg, "psd.flow")
+    for i, block in enumerate(injections):
+        if not isinstance(block, dict):
+            continue
+        block_banks = block.get("banks", banks_used)
+        if not isinstance(block_banks, list):
+            continue
+        for name in block_banks:
+            entry = bank_table.get(name)
+            if not isinstance(entry, dict):
+                continue  # already reported above as an undefined bank
+            if entry.get("flow") is None and global_flow == "__MISSING__":
+                errors.append(
+                    "injections[%d] ('%s') bank '%s': no resolvable --flow "
+                    "(set banks.%s.flow or the global psd.flow)"
+                    % (i, block.get("name"), name, name))
+
+    if errors:
+        raise ConfigError(
+            "config schema validation failed (%d issue%s):\n  - %s\n\n%s"
+            % (len(errors), "" if len(errors) == 1 else "s",
+               "\n  - ".join(errors), SCHEMA_HELP))
+
+
+# ---------------------------------------------------------------------------
+# DAG construction
+# ---------------------------------------------------------------------------
+
+_NAME_SANITIZE_RE = re.compile(r"[^A-Za-z0-9_.-]")
+
+
+def _sanitize(name):
+    return _NAME_SANITIZE_RE.sub("_", str(name))
+
+
+class SubFile(object):
+    """One HTCondor submit file, shared by every DAG node of its job class
+    (per-node values arrive via DAGMan VARS macros, e.g. $(injmin))."""
+
+    def __init__(self, name, executable, universe="vanilla"):
+        self.name = name
+        self.executable = executable
+        self.universe = universe
+        self.arguments = []          # list of "--opt value" or "--flag" tokens, may use $(macro)
+        self.condor_cmds = []        # list of (key, value) pairs, in insertion order
+        self.initialdir = None
+        self.log = "logs/%s-$(cluster)-$(process).log" % name
+        self.output = "logs/%s-$(cluster)-$(process).out" % name
+        self.error = "logs/%s-$(cluster)-$(process).err" % name
+
+    def add_arg(self, token):
+        self.arguments.append(token)
+
+    def add_opt(self, opt, value):
+        self.arguments.append("--%s %s" % (opt, value))
+
+    def add_cmd(self, key, value):
+        self.condor_cmds.append((key, value))
+
+    def render(self):
+        lines = ["universe = %s" % self.universe,
+                  "executable = %s" % self.executable]
+        if self.initialdir:
+            lines.append("initialdir = %s" % self.initialdir)
+        if self.arguments:
+            lines.append('arguments = "%s"' % " ".join(self.arguments))
+        for key, value in self.condor_cmds:
+            lines.append("%s = %s" % (key, value))
+        lines.append("log = %s" % self.log)
+        lines.append("output = %s" % self.output)
+        lines.append("error = %s" % self.error)
+        lines.append("notification = never")
+        lines.append("queue")
+        return "\n".join(lines) + "\n"
+
+    def filename(self):
+        return "%s.sub" % self.name
+
+
+class DagNode(object):
+    def __init__(self, name, sub, vars_=None, retry=3):
+        self.name = name
+        self.sub = sub
+        self.vars = vars_ or {}
+        self.retry = retry
+        self.parents = []
+
+
+class DagPlan(object):
+    def __init__(self, basename):
+        self.basename = basename
+        self.subs = {}    # name -> SubFile
+        self.nodes = []   # ordered list of DagNode
+
+    def add_sub(self, sub):
+        self.subs[sub.name] = sub
+        return sub
+
+    def add_node(self, node):
+        self.nodes.append(node)
+        return node
+
+    def render_dag(self):
+        lines = []
+        for node in self.nodes:
+            lines.append("JOB %s %s" % (node.name, node.sub.filename()))
+            if node.vars:
+                var_str = " ".join('%s="%s"' % (k, v) for k, v in node.vars.items())
+                lines.append("VARS %s %s" % (node.name, var_str))
+            lines.append("RETRY %s %d" % (node.name, node.retry))
+        for node in self.nodes:
+            if node.parents:
+                lines.append("PARENT %s CHILD %s" % (" ".join(node.parents), node.name))
+        return "\n".join(lines) + "\n"
+
+    def write(self, output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(os.path.join(output_dir, "logs"), exist_ok=True)
+        for sub in self.subs.values():
+            with open(os.path.join(output_dir, sub.filename()), "w") as fh:
+                fh.write(sub.render())
+        with open(os.path.join(output_dir, "%s.dag" % self.basename), "w") as fh:
+            fh.write(self.render_dag())
+
+
+def _condor_resource_cmds(sub, condor_cfg):
+    sub.add_cmd("request_memory", condor_cfg.get("request_memory", 3999))
+    sub.add_cmd("request_disk", condor_cfg.get("request_disk", "4096MB"))
+    sub.add_cmd("request_cpus", condor_cfg.get("request_cpus", 1))
+
+
+def _condor_accounting_cmds(sub, condor_cfg):
+    sub.add_cmd("accounting_group", condor_cfg["accounting_group"])
+    if condor_cfg.get("accounting_group_user"):
+        sub.add_cmd("accounting_group_user", condor_cfg["accounting_group_user"])
+
+
+def _condor_transfer_cmds(sub, condor_cfg, input_files):
+    if not condor_cfg.get("should_transfer_files", True):
+        return
+    sub.add_cmd("should_transfer_files", "YES")
+    sub.add_cmd("when_to_transfer_output", "ON_EXIT_OR_EVICT")
+    files = list(input_files) + list(condor_cfg.get("extra_input_files", []))
+    if files:
+        sub.add_cmd("transfer_input_files", ",".join(files))
+
+
+def _condor_container_cmds(sub, condor_cfg):
+    image = condor_cfg["container_image"]
+    # See bin/sbank_sim_pipe's _apply_container() docstring for the same
+    # sourcing note: HTCondor manual `container_image` (osdf:///cvmfs://
+    # aware) plus the classic +SingularityImage classad, emitted together
+    # for pool-migration compatibility. FLAGGED FOR REVIEWER (uncertain,
+    # not verified against a live IGWN submit host from this environment).
+    sub.add_cmd("container_image", image)
+    sub.add_cmd("+SingularityImage", '"%s"' % image)
+    sub.add_cmd("getenv", "OMP_NUM_THREADS,OPENBLAS_NUM_THREADS")
+
+
+def build_plan(cfg, user_tag=None):
+    run = cfg["run"]
+    run_name = user_tag or run["name"]
+    basename = _sanitize(run_name)
+    condor_cfg = cfg.get("condor", {})
+    psd_cfg = cfg["psd"]
+    output_dir_analysis = cfg["output"]["dir"]
+    tidal_cfg = cfg.get("tidal")
+    ecc_cfg = cfg.get("eccentric")
+    apply_no_ilwdchar = run.get("apply_no_ilwdchar", True)
+    emit_plot = run.get("emit_plot", True)
+    banks_used = run["banks"]
+    bank_table = cfg["banks"]
+
+    sbank_sim_exe = condor_cfg.get("sbank_sim_executable", "sbank_sim")
+    no_ilwdchar_exe = condor_cfg.get("no_ilwdchar_executable", "ligolw_no_ilwdchar")
+
+    plan = DagPlan(basename)
+
+    for block in cfg["injections"]:
+        injname = _sanitize(block["name"])
+        njobs = block["njobs"]
+        ninj = block["injections_per_job"]
+        inj_file = block["injection_file"]
+        approx = block["approximant"]
+
+        banks_used_block = block.get("banks", banks_used)
+
+        noilwd_node_name = None
+        if apply_no_ilwdchar:
+            noilwd_sub = plan.add_sub(SubFile(
+                "noilwd_%s" % injname, no_ilwdchar_exe, universe="local"))
+            _condor_resource_cmds(noilwd_sub, {"request_memory": 1999,
+                                                "request_disk": "1MB",
+                                                "request_cpus": 1})
+            _condor_accounting_cmds(noilwd_sub, condor_cfg)
+            noilwd_sub.add_arg(inj_file)
+            noilwd_node_name = "NOILWD_%s" % injname
+            plan.add_node(DagNode(noilwd_node_name, noilwd_sub))
+
+        for bank_name in banks_used_block:
+            bank_entry = bank_table[bank_name]
+            bank_path = bank_entry["path"]
+            bank_approx = bank_entry.get("approximant")
+            template_bank_arg = ("%s:%s" % (bank_path, bank_approx)
+                                  if bank_approx else bank_path)
+            # P1 (NB-1): per-bank flow override, user-specified as data --
+            # falls back to the global psd.flow when a bank doesn't set its
+            # own (validate_schema already guarantees one of the two exists
+            # for every leg actually used).
+            bank_flow = bank_entry.get("flow", psd_cfg.get("flow"))
+            bank_fhigh_max = bank_entry.get("fhigh_max")
+            # P2 (NB-2): display casing for dirs/tags/node names -- defaults
+            # to the bank's own YAML key, but a bank entry may set `tag:` to
+            # match a historical/external naming convention (e.g. tag: SSM
+            # for the ssm key) without the generator hardcoding that mapping.
+            bank_tag = _sanitize(str(bank_entry.get("tag", bank_name)))
+
+            job_tag = "banksim_%s_%s" % (injname, bank_tag)
+            sub = plan.add_sub(SubFile(job_tag, sbank_sim_exe))
+            sub.initialdir = os.path.join(output_dir_analysis, "%s_%s" % (injname, bank_tag))
+            _condor_resource_cmds(sub, condor_cfg)
+            _condor_accounting_cmds(sub, condor_cfg)
+            static_inputs = [inj_file, bank_path]
+            if psd_cfg.get("reference_psd"):
+                static_inputs.append(psd_cfg["reference_psd"])
+            _condor_transfer_cmds(sub, condor_cfg, static_inputs)
+            _condor_container_cmds(sub, condor_cfg)
+
+            sub.add_opt("injection-file", inj_file)
+            sub.add_opt("injection-approx", approx)
+            sub.add_opt("injection-min", "$(injmin)")
+            sub.add_opt("injection-max", "$(injmax)")
+            sub.add_opt("user-tag", "$(tag)")
+            sub.add_opt("template-bank", template_bank_arg)
+            if psd_cfg.get("reference_psd"):
+                sub.add_opt("reference-psd", psd_cfg["reference_psd"])
+                sub.add_opt("instrument", psd_cfg["instrument"])
+            elif psd_cfg.get("noise_model"):
+                sub.add_opt("noise-model", psd_cfg["noise_model"])
+            sub.add_opt("flow", bank_flow)
+            if bank_fhigh_max is not None:
+                sub.add_opt("fhigh-max", bank_fhigh_max)
+            if tidal_cfg:
+                sub.add_opt("tidal-lambda-columns", tidal_cfg.get("lambda_columns", "alpha:alpha1"))
+                sub.add_opt("tidal-ffinal-mode", tidal_cfg.get("ffinal_mode", "disruption"))
+            if ecc_cfg:
+                sub.add_opt("ecc-columns", ecc_cfg.get("ecc_columns", "alpha2:alpha3"))
+                sub.add_opt("ecc-f-ref", ecc_cfg.get("ecc_f_ref", 20.0))
+
+            bank_node_names = []
+            for j in range(njobs):
+                tag = "SBANK_SIM_%s_%s_%05d" % (injname, bank_tag, j)
+                node_name = "SIM_%s_%s_%05d" % (injname, bank_tag, j)
+                node = DagNode(node_name, sub, vars_={
+                    "injmin": j * ninj, "injmax": (j + 1) * ninj, "tag": tag,
+                })
+                if noilwd_node_name:
+                    node.parents.append(noilwd_node_name)
+                plan.add_node(node)
+                bank_node_names.append(node_name)
+
+            if emit_plot:
+                plot_sub = plan.add_sub(SubFile(
+                    "plot_%s_%s" % (injname, bank_tag),
+                    condor_cfg.get("sbank_plot_sim_executable", "sbank_plot_sim"),
+                    universe="local"))
+                _condor_resource_cmds(plot_sub, {"request_memory": 3999,
+                                                  "request_disk": "1MB",
+                                                  "request_cpus": 1})
+                _condor_accounting_cmds(plot_sub, condor_cfg)
+                plot_sub.initialdir = sub.initialdir
+                for j in range(njobs):
+                    plot_sub.add_arg("SBANK_SIM_%s_%s_%05d.h5" % (injname, bank_tag, j))
+                plot_node = DagNode("PLOT_%s_%s" % (injname, bank_tag), plot_sub)
+                plot_node.parents.extend(bank_node_names)
+                plan.add_node(plot_node)
+
+    return plan
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Generate an HTCondor DAGMan workflow for an sbank_sim "
+                     "banksim campaign from a YAML config (WP7 Part B).",
+        epilog=SCHEMA_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("config", help="Path to a configs/<runtype>.yaml campaign config.")
+    parser.add_argument("--output-dir", required=True,
+                         help="Directory to write the .dag/.sub/logs files into "
+                              "(distinct from the YAML's output.dir, which is where "
+                              "the campaign's own .h5 products land).")
+    parser.add_argument("--allow-placeholders", action="store_true",
+                         help="Allow unresolved {{TOKEN}} placeholders to pass through "
+                              "into the emitted files (for lint/test purposes only -- "
+                              "the resulting DAG is not submittable as-is).")
+    parser.add_argument("--set", dest="overrides", action="append", default=[],
+                         metavar="TOKEN=VALUE",
+                         help="Fill a {{TOKEN}} placeholder with VALUE. Repeatable.")
+    parser.add_argument("--user-tag", default=None,
+                         help="Override the DAG basename / run.name for job naming.")
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    try:
+        overrides = parse_overrides(args.overrides)
+        text = load_raw_text(args.config)
+        text = apply_overrides(text, overrides)
+        unresolved = find_unresolved_placeholders(text)
+        if unresolved and not args.allow_placeholders:
+            raise ConfigError(
+                "unresolved placeholders in %s: %s\n"
+                "Fill them with --set TOKEN=VALUE, or pass --allow-placeholders "
+                "to generate anyway (lint/test use only)." % (
+                    args.config, ", ".join(unresolved)))
+        cfg = yaml.safe_load(text)
+        if not isinstance(cfg, dict):
+            raise ConfigError("%s did not parse to a YAML mapping" % args.config)
+        validate_schema(cfg)
+        plan = build_plan(cfg, user_tag=args.user_tag)
+        plan.write(args.output_dir)
+    except ConfigError as exc:
+        sys.stderr.write("sbank_sim_dag_config: error: %s\n" % exc)
+        return 1
+    n_jobs = sum(1 for n in plan.nodes)
+    print("wrote %s.dag (%d node%s) + %d sub file%s to %s" % (
+        plan.basename, n_jobs, "" if n_jobs == 1 else "s",
+        len(plan.subs), "" if len(plan.subs) == 1 else "s", args.output_dir))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

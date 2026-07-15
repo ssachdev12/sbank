@@ -1,0 +1,94 @@
+# WP7 campaign config template -- tidal SUBSOLAR
+#
+# Existing production campaign shape (CLAUDE.md: "sub-solar-mass/SSM"), documented per
+# WP7.md's requirement to ship a template for every run type. F4 sheet section 6:
+# "No subsolar re-runs (C5 uses the existing SSM study)" -- this template is for
+# reproducing/re-running that existing study, not a new F4-scoped campaign.
+#
+# Model: TaylorF2Tidal ONLY. Per WP2_memo.md section 0.1/section 2: of every tidal
+# model available in this environment, TaylorF2 + PN tidal is the ONLY one that stays
+# robust up to subsolar-scale Lambda (~5e6) -- NRTidal Phenom families run but are
+# either out of calibration (IMRPhenomXAS_NRTidalv2: phase collapses to garbage) or
+# refuse the input outright (IMRPhenomXAS_NRTidalv3 rejects Lambda>=1e6;
+# SEOBNRv5_ROM_NRTidalv3 segfaults). Do not substitute an NRTidal model here.
+#
+# tidal-ffinal-mode: EXPLICIT and set to "disruption" (WP6's post-Roche-overflow
+# default -- see .claude-wp/WP6_report.md's reproducibility warning: a pre-WP6 command
+# line rerun WITHOUT --tidal-ffinal-mode contact now silently produces different FFs,
+# because disruption also folds in Roche-lobe overflow on top of the WP3/WP5 C-Love
+# contact-frequency cutoff). This is a deliberate physics choice (2026-07-15 gate,
+# per WP6_report.md): disruption is the physically defensible default for subsolar
+# campaigns specifically. If you need to reproduce a PRE-WP6 subsolar map bin-for-bin,
+# override to "contact" explicitly and note that override in your own campaign README.
+
+run:
+  name: tidalSubsolar
+  banks: [allsky, ssm, all]   # allsky contributes ~0 FF at subsolar mass but is still
+                                # measured, matching the paper's ff_best band-power-scaled
+                                # max(stellar, SSM) convention (CLAUDE.md) -- "match the
+                                # existing BNS campaign exactly" per F4 sheet section 1.
+  apply_no_ilwdchar: true
+  emit_plot: true
+
+injections:
+  - name: tidalSubsolar
+    injection_file: "{{INJECTION_FILE_TIDAL_SUBSOLAR}}"
+    approximant: TaylorF2Tidal
+    n_total: 100000
+    njobs: 5000
+    injections_per_job: 20
+    params:
+      mass1: {dist: uniform, min: 0.2, max: 1.0, unit: Msun, frame: detector}
+      mass2: {dist: uniform, min: 0.2, max: 1.0, unit: Msun, frame: detector}
+      spin1z: {dist: uniform, min: -0.05, max: 0.05}
+      spin2z: {dist: uniform, min: -0.05, max: 0.05}
+      lambda1: {dist: log-uniform, min: 1.0e3, max: 5.0e6,
+                note: "Bandopadhyay & Brown range, arXiv:2212.03855"}
+      lambda2: {dist: log-uniform, min: 1.0e3, max: 5.0e6}
+    notes: "f_low = 45 Hz for the SSM band (match integral), NOT the 15 Hz stellar/allsky
+           value -- see F4 sheet section 1.2. WP8 (P1/NB-1 fix): the generator now
+           supports a per-bank banks.<name>.flow override, so the SSM/allsky f_low
+           split below is threaded through automatically (each bank leg emits its own
+           --flow) rather than requiring a by-hand edit of a per-bank sbank_sim
+           invocation."
+
+banks:
+  allsky:
+    path: "{{BANK_PATH_ALLSKY}}"
+    flow: 15.0   # GstLAL O4 stellar/allsky match-integral f_low convention (F4 section
+                 # 1.2) -- per-bank override so this leg no longer inherits the SSM-
+                 # campaign's 45 Hz global default (WP7 NB-1 fix).
+  ssm:
+    path: "{{BANK_PATH_SSM}}"
+    tag: SSM     # historical campaign directory/tag casing (WP7 NB-2)
+    flow: 45.0   # GstLAL O4 SSM match-integral f_low convention (F4 section 1.2)
+  all:
+    path: "{{BANK_PATH_ALL}}"
+    tag: ALL     # historical campaign directory/tag casing (WP7 NB-2)
+    # No per-bank flow override -- falls back to the global psd.flow below (45 Hz,
+    # this campaign's SSM-focused convention: allsky contributes ~0 FF at subsolar
+    # mass per the run.banks comment above, so the combined "all"/ALL leg follows
+    # the SSM convention here). See r1's banks.all note for the general open item.
+
+psd:
+  reference_psd: "{{PSD_PATH}}"
+  instrument: L1
+  flow: 45.0   # Fallback for legs without their own banks.<name>.flow (currently just
+               # the combined "all"/ALL leg -- allsky/ssm are explicit above, WP7 NB-1 fix).
+
+tidal:
+  ffinal_mode: disruption   # EXPLICIT default -- see header note. Alternatives: contact, isco.
+  lambda_columns: "alpha:alpha1"
+
+condor:
+  accounting_group: "{{ACCOUNTING_TAG}}"
+  accounting_group_user: "{{ACCOUNTING_USER}}"
+  request_memory: 3999
+  request_disk: "4096MB"
+  request_cpus: 1
+  container_image: "osdf:///{{CONTAINER_OSDF_PATH}}/sbank-igwn.sif"
+  should_transfer_files: true
+
+output:
+  dir: "{{OUTPUT_DIR}}"
+  log_dir: "{{LOG_DIR}}"

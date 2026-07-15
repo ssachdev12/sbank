@@ -1,0 +1,112 @@
+# WP7 campaign config template -- R1 eccentricBNSlowspin
+#
+# Source: F4 campaign sheet (.../banksims/recovery/impact_scoping/notes/F4_banksim_spec.md,
+# READ-ONLY reference), section "R1 -- eccentricBNSlowspin". Priority P0.
+#
+# Primary block: 100,000 injections (5000 x 20), TaylorF2Ecc, aligned low-spin BNS,
+# against all three banks (allsky + SSM + ALL), exactly like the existing BNS campaign.
+# Jobs 0-249 of the primary block are the e=0 control block (see control_block below).
+#
+# Cross-check block: 5,000 injections (250 x 20), SEOBNRv5EHM, allsky bank ONLY,
+# weighted toward the top two eccentricity deciles (REV1/referee R2). Gate: median
+# |dFF| between families <= 0.01 in e-deciles.
+#
+# All cluster paths below are PLACEHOLDERS -- fill with --set TOKEN=VALUE or edit a copy.
+# {{ACCOUNTING_TAG}}/{{ACCOUNTING_USER}} are NOT production values.
+
+run:
+  name: eccentricBNSlowspin
+  banks: [allsky, ssm, all]
+  apply_no_ilwdchar: true    # legacy ilwdchar strip; see bin/sbank_sim_pipe's NoIlwdJob
+                              # docstring (WP7 audit item 6) -- still needed for legacy
+                              # ilwdchar-tagged injection XML, tool ships with python-ligo-lw.
+  emit_plot: true
+
+injections:
+  - name: eccentricBNSlowspin
+    injection_file: "{{INJECTION_FILE_R1_PRIMARY}}"
+    approximant: TaylorF2Ecc
+    n_total: 100000
+    njobs: 5000
+    injections_per_job: 20
+    control_block:
+      job_start: 0
+      job_end: 249
+      note: "e = 0 control block (5,000 injections): identical mass/spin draws with
+             eccentricity forced to 0, to measure the TaylorF2Ecc-vs-SpinTaylorT4
+             family offset against the existing alignedlowspinBNS map."
+    params:
+      mass1: {dist: uniform, min: 1.0, max: 3.0, unit: Msun, frame: detector}
+      mass2: {dist: uniform, min: 1.0, max: 3.0, unit: Msun, frame: detector}
+      spin1z: {dist: uniform, min: -0.05, max: 0.05}
+      spin2z: {dist: uniform, min: -0.05, max: 0.05}
+      eccentricity: {dist: log-uniform, min: 0.005, max: 0.4, f_ref_hz: 20}
+    notes: "Reference-frequency convention: e quoted at f_ref = 20 Hz (comparability
+           with Gupte+ and Wang & Nitz). If lalsuite defines the eccentricity parameter
+           at f_low instead, record BOTH the raw input value and the converted e@20Hz
+           per injection (F4 sheet section 1.6)."
+
+  - name: eccBNSxchkEHM
+    banks: [allsky]    # cross-check runs against the allsky bank only (overrides run.banks)
+    injection_file: "{{INJECTION_FILE_R1_XCHECK}}"
+    approximant: SEOBNRv5EHM   # requires pyseobnr -- container/sbank-igwn.def image, NOT
+                                 # the lighter igwn-py311 native env (see container/README.md)
+    n_total: 5000
+    njobs: 250
+    injections_per_job: 20
+    params:
+      draw_weighting: "60% of draws from e in [0.25, 0.4] (top two e-deciles), 40% from
+                       the remainder of the R1 mass/spin/e distribution -- REV1/referee R2:
+                       TaylorF2Ecc is a low-e expansion, so the cross-check gate needs its
+                       densest statistics exactly where TaylorF2Ecc is most suspect."
+      mean_anomaly: {dist: uniform, min: 0.0, max: 6.283185307, note: "randomize + record"}
+    notes: "Gate: median |dFF(TaylorF2Ecc, SEOBNRv5EHM)| <= 0.01 per e-decile; if violated
+           the TaylorF2Ecc production map must carry the difference as a systematic band."
+
+banks:
+  allsky:
+    path: "{{BANK_PATH_ALLSKY}}"
+    # approximant left unset: allsky BNS bank is TaylorF2 by convention for this scenario;
+    # sbank_sim uses the bank's own approximant column if none is given here.
+    flow: 15.0   # GstLAL O4 stellar/allsky match-integral f_low convention (F4 sheet
+                 # section 1.2). Explicit per-bank data, not a generator-hardcoded default.
+  ssm:
+    path: "{{BANK_PATH_SSM}}"
+    tag: SSM     # historical campaign directory/tag casing (WP7 NB-2) -- matches
+                 # 01_consolidate_banksim.py's SCENARIOS globs (e.g. alignedlowspinBNS_SSM/)
+    flow: 45.0   # GstLAL O4 SSM match-integral f_low convention (F4 sheet section 1.2) --
+                 # per-bank override so the SSM leg no longer inherits the allsky f_low
+                 # (WP7 NB-1: previously this leg silently ran at 15 Hz instead of 45 Hz).
+  all:
+    path: "{{BANK_PATH_ALL}}"
+    tag: ALL     # historical campaign directory/tag casing (WP7 NB-2)
+    # No per-bank flow override: this combined-bank ("ALL") leg falls back to the
+    # global psd.flow below. F4 does not specify a distinct f_low convention for the
+    # combined-bank match integral; this is an open item for the follow-up plan
+    # (see READINESS.md's "what the follow-up plan needs" list).
+
+psd:
+  reference_psd: "{{PSD_PATH}}"   # same O4 Advanced LIGO PSD as the existing BNS study
+  instrument: L1
+  flow: 15.0    # Fallback f_low for any bank leg without its own banks.<name>.flow --
+                # currently only the combined "all"/ALL leg (see banks.all note above).
+                # allsky/ssm now carry their own explicit per-bank flow (WP7 NB-1 fix).
+
+eccentric:
+  ecc_columns: "alpha2:alpha3"   # matches bin/sbank_sim's --ecc-columns default transport
+  ecc_f_ref: 20.0
+
+condor:
+  accounting_group: "{{ACCOUNTING_TAG}}"
+  accounting_group_user: "{{ACCOUNTING_USER}}"
+  request_memory: 3999
+  request_disk: "4096MB"
+  request_cpus: 1
+  container_image: "osdf:///{{CONTAINER_OSDF_PATH}}/sbank-igwn.sif"
+  should_transfer_files: true
+  sbank_sim_executable: sbank_sim
+  no_ilwdchar_executable: ligolw_no_ilwdchar
+
+output:
+  dir: "{{OUTPUT_DIR}}"
+  log_dir: "{{LOG_DIR}}"

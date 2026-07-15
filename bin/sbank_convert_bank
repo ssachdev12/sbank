@@ -1,0 +1,136 @@
+#!/usr/bin/env python
+"""Convert externally produced template banks to native sbank HDF5."""
+
+from __future__ import print_function
+
+import argparse
+import os
+import sys
+
+import h5py
+import numpy as np
+
+
+REQUIRED_PYCBC = ("mass1", "mass2", "spin1z", "spin2z")
+NATIVE_FIELDS = (
+    ("mass1", np.float32), ("mass2", np.float32),
+    ("spin1z", np.float32), ("spin2z", np.float32),
+    ("template_duration", np.float32), ("f_lower", np.float32),
+    ("approximant", "S32"),
+)
+
+
+def fail(message):
+    raise ValueError(message)
+
+
+def convert_pycbc(source, destination, approximant, fallback_flow=None):
+    from sbank.waveforms import waveforms
+    if approximant not in waveforms:
+        fail("unknown sbank --approximant %r; expected one of: %s" %
+             (approximant, ", ".join(sorted(waveforms))))
+    with h5py.File(source, "r") as src:
+        found = sorted(src.keys())
+        if "parameters" in src.attrs:
+            fail("ambiguous/already-native HDF5: found sbank 'parameters' "
+                 "attribute and PyCBC-compatible datasets; refusing to guess. "
+                 "Found datasets: %s" % (", ".join(found) or "(none)"))
+        missing = [name for name in REQUIRED_PYCBC if name not in src]
+        if missing:
+            fail("PyCBC schema detection failed: missing required dataset(s): %s; "
+                 "found datasets: %s; expected at least: %s" %
+                 (", ".join(missing), ", ".join(found) or "(none)",
+                  ", ".join(REQUIRED_PYCBC)))
+        non_datasets = [name for name in REQUIRED_PYCBC
+                        if not isinstance(src[name], h5py.Dataset)]
+        if non_datasets:
+            fail("PyCBC schema detection failed: expected root-level datasets, "
+                 "but found non-dataset entries: %s" % ", ".join(non_datasets))
+        lengths = {name: len(src[name]) for name in REQUIRED_PYCBC
+                   if src[name].ndim == 1}
+        bad_dims = [name for name in REQUIRED_PYCBC if src[name].ndim != 1]
+        if bad_dims or len(set(lengths.values())) != 1:
+            fail("PyCBC schema detection failed: required parameters must be "
+                 "equal-length 1-D datasets; shapes found: %s" %
+                 ", ".join("%s=%s" % (n, src[n].shape) for n in REQUIRED_PYCBC))
+        count = next(iter(lengths.values()))
+
+        if "f_lower" in src:
+            if src["f_lower"].ndim != 1 or len(src["f_lower"]) != count:
+                fail("PyCBC schema detection failed: f_lower must be a 1-D "
+                     "dataset with %d entries; found shape %s" %
+                     (count, src["f_lower"].shape))
+            flow = np.asarray(src["f_lower"][:], dtype=np.float32)
+        elif fallback_flow is not None:
+            flow = np.full(count, fallback_flow, dtype=np.float32)
+        else:
+            fail("PyCBC schema detection failed: missing dataset f_lower; "
+                 "provide --f-lower if the bank uses one global cutoff. Found "
+                 "datasets: %s" % (", ".join(found) or "(none)"))
+
+        if "template_duration" in src:
+            duration = np.asarray(src["template_duration"][:], dtype=np.float32)
+            if duration.ndim != 1 or len(duration) != count:
+                fail("PyCBC template_duration must be a 1-D dataset with %d entries"
+                     % count)
+        else:
+            duration = np.zeros(count, dtype=np.float32)
+
+        output = {
+            name: np.asarray(src[name][:], dtype=np.float32)
+            for name in REQUIRED_PYCBC
+        }
+        output["template_duration"] = duration
+        output["f_lower"] = flow
+        try:
+            approx_bytes = approximant.encode("ascii")
+        except UnicodeEncodeError:
+            fail("--approximant must be an ASCII sbank registry name")
+        if len(approx_bytes) > 32:
+            fail("--approximant is too long for the native S32 field")
+        output["approximant"] = np.full(count, approx_bytes, dtype="S32")
+
+    if os.path.exists(destination):
+        fail("refusing to overwrite existing output: %s" % destination)
+    with h5py.File(destination, "w") as dst:
+        dst.attrs["parameters"] = [name.encode("utf-8") for name, _ in NATIVE_FIELDS]
+        for name, dtype in NATIVE_FIELDS:
+            dst.create_dataset(name, data=np.asarray(output[name], dtype=dtype))
+
+
+def convert_mbta(_source, _destination, _approximant, _fallback_flow=None):
+    fail("MBTA schema unverified — provide a sample file. Must confirm file "
+         "format, parameter columns, f_low convention, and split-bank structure.")
+
+
+def parser():
+    description = """Convert a PyCBC bank to native sbank HDF5. PyCBC labels are
+not silently translated: select the filtering class explicitly. Typical mappings:
+SPAtmplt -> TaylorF2; TaylorF2 -> TaylorF2; IMRPhenomD -> IMRPhenomD;
+SEOBNRv4_ROM -> SEOBNRv4_ROM. The selected name must exist in sbank's waveform
+registry when the result is loaded. MBTA is a requirements-only stub until a sample
+distribution is available."""
+    p = argparse.ArgumentParser(description=description,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("input", help="input bank file")
+    p.add_argument("output", help="native sbank HDF5 output")
+    p.add_argument("--format", choices=("pycbc", "mbta"), default="pycbc",
+                   help="source schema (default: pycbc)")
+    p.add_argument("--approximant", required=True,
+                   help="sbank waveform registry name used for every output template")
+    p.add_argument("--f-lower", type=float, default=None,
+                   help="global low-frequency cutoff if the PyCBC file lacks f_lower")
+    return p
+
+
+def main(argv=None):
+    args = parser().parse_args(argv)
+    action = convert_pycbc if args.format == "pycbc" else convert_mbta
+    try:
+        action(args.input, args.output, args.approximant, args.f_lower)
+    except (OSError, ValueError) as exc:
+        parser().error(str(exc))
+
+
+if __name__ == "__main__":
+    main()

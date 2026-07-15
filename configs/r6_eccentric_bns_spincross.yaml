@@ -1,0 +1,72 @@
+# WP7 campaign config template -- R6 eccentricBNSspincross (spin-cross variant stub)
+#
+# Source: F4 campaign sheet, section "R6 -- eccentricBNSspincross". Priority P2,
+# OPTIONAL -- "Run only if R1 shows FF structure worth crossing" (F4 sheet). This is a
+# STUB template: same shape as R1's primary block but a wider aligned-spin range and no
+# cross-check block, at half R1's N. Do not launch without confirming R1 first per the
+# F4 sheet's own gating language.
+#
+# All cluster paths below are PLACEHOLDERS.
+
+run:
+  name: eccentricBNSspincross
+  banks: [allsky, ssm, all]
+  apply_no_ilwdchar: true
+  emit_plot: true
+
+injections:
+  - name: eccentricBNSspincross
+    injection_file: "{{INJECTION_FILE_R6}}"
+    approximant: TaylorF2Ecc
+    n_total: 50000
+    njobs: 2500
+    injections_per_job: 20
+    params:
+      mass1: {dist: uniform, min: 1.0, max: 3.0, unit: Msun, frame: detector}
+      mass2: {dist: uniform, min: 1.0, max: 3.0, unit: Msun, frame: detector}
+      spin1z: {dist: uniform, min: -0.4, max: 0.4}
+      spin2z: {dist: uniform, min: -0.4, max: 0.4}
+      eccentricity: {dist: log-uniform, min: 0.005, max: 0.4, f_ref_hz: 20}
+    notes: "Joint (chi_eff, e) BNS R90 surface -- does the SSM rescue of high-spin BNS
+           survive when the signal is also eccentric? Wider spin range than R1
+           (+-0.4 vs +-0.05) is the whole point of this variant; everything else
+           (bank set, approximant, e distribution, f_ref convention) matches R1."
+
+banks:
+  allsky:
+    path: "{{BANK_PATH_ALLSKY}}"
+    flow: 15.0   # GstLAL O4 stellar/allsky match-integral f_low convention (F4 section 1.2)
+  ssm:
+    path: "{{BANK_PATH_SSM}}"
+    tag: SSM     # historical campaign directory/tag casing (WP7 NB-2)
+    flow: 45.0   # GstLAL O4 SSM match-integral f_low convention (F4 section 1.2);
+                 # per-bank override so this leg no longer inherits allsky's 15 Hz
+                 # (WP7 NB-1 fix).
+  all:
+    path: "{{BANK_PATH_ALL}}"
+    tag: ALL     # historical campaign directory/tag casing (WP7 NB-2)
+    # No per-bank flow override -- falls back to the global psd.flow below; see
+    # r1's banks.all note (same open item: combined-bank f_low convention).
+
+psd:
+  reference_psd: "{{PSD_PATH}}"
+  instrument: L1
+  flow: 15.0   # Fallback for legs without their own banks.<name>.flow (currently
+               # just the combined "all"/ALL leg -- allsky/ssm are explicit above).
+
+eccentric:
+  ecc_columns: "alpha2:alpha3"
+  ecc_f_ref: 20.0
+
+condor:
+  accounting_group: "{{ACCOUNTING_TAG}}"
+  accounting_group_user: "{{ACCOUNTING_USER}}"
+  request_memory: 3999
+  request_disk: "4096MB"
+  request_cpus: 1
+  container_image: "osdf:///{{CONTAINER_OSDF_PATH}}/sbank-igwn.sif"
+  should_transfer_files: true
+
+output:
+  dir: "{{OUTPUT_DIR}}"
+  log_dir: "{{LOG_DIR}}"
