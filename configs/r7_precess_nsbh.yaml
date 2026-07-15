@@ -5,6 +5,11 @@
 # Approximant: IMRPhenomXP_NRTidalv2 (registered in sbank/waveforms.py, WP5) -- a
 # tidal-capable precessing model is mandatory here: per WP2_memo.md section 5,
 # plain IMRPhenomXPHM *errors* if a tidal Lambda is passed to it.
+#
+# The tidal: block below is added for self-documentation (WP7 review NB-4): it is
+# functionally a no-op (bin/sbank_sim's own --tidal-lambda-columns/--tidal-ffinal-mode
+# defaults are identical), but stating the values explicitly keeps this config as
+# self-documenting as tidal_bns.yaml/tidal_subsolar.yaml.
 
 run:
   name: precessNSBH
@@ -44,6 +49,12 @@ psd:
   reference_psd: "{{PSD_PATH}}"
   instrument: L1
   flow: 15.0
+
+tidal:
+  ffinal_mode: disruption   # explicit for self-documentation (WP7 NB-4) -- identical
+                              # to bin/sbank_sim's own default (WP6's Roche-overflow rule)
+  lambda_columns: "alpha:alpha1"   # explicit for self-documentation (WP7 NB-4) -- identical
+                                     # to bin/sbank_sim's own default
 
 condor:
   accounting_group: "{{ACCOUNTING_TAG}}"

@@ -46,26 +46,35 @@ injections:
                 note: "Bandopadhyay & Brown range, arXiv:2212.03855"}
       lambda2: {dist: log-uniform, min: 1.0e3, max: 5.0e6}
     notes: "f_low = 45 Hz for the SSM band (match integral), NOT the 15 Hz stellar/allsky
-           value -- see F4 sheet section 1.2 / psd.flow below applies to the allsky
-           entry only; per-bank f_low overrides are not modeled by this generator's
-           schema yet (single global psd.flow) -- FLAGGED FOR REVIEWER: if the SSM/allsky
-           f_low split needs to be threaded through automatically rather than by editing
-           a per-bank sbank_sim invocation by hand, that is a schema extension beyond
-           this WP7 generator's current scope."
+           value -- see F4 sheet section 1.2. WP8 (P1/NB-1 fix): the generator now
+           supports a per-bank banks.<name>.flow override, so the SSM/allsky f_low
+           split below is threaded through automatically (each bank leg emits its own
+           --flow) rather than requiring a by-hand edit of a per-bank sbank_sim
+           invocation."
 
 banks:
   allsky:
     path: "{{BANK_PATH_ALLSKY}}"
+    flow: 15.0   # GstLAL O4 stellar/allsky match-integral f_low convention (F4 section
+                 # 1.2) -- per-bank override so this leg no longer inherits the SSM-
+                 # campaign's 45 Hz global default (WP7 NB-1 fix).
   ssm:
     path: "{{BANK_PATH_SSM}}"
+    tag: SSM     # historical campaign directory/tag casing (WP7 NB-2)
+    flow: 45.0   # GstLAL O4 SSM match-integral f_low convention (F4 section 1.2)
   all:
     path: "{{BANK_PATH_ALL}}"
+    tag: ALL     # historical campaign directory/tag casing (WP7 NB-2)
+    # No per-bank flow override -- falls back to the global psd.flow below (45 Hz,
+    # this campaign's SSM-focused convention: allsky contributes ~0 FF at subsolar
+    # mass per the run.banks comment above, so the combined "all"/ALL leg follows
+    # the SSM convention here). See r1's banks.all note for the general open item.
 
 psd:
   reference_psd: "{{PSD_PATH}}"
   instrument: L1
-  flow: 45.0   # SSM band match-integral f_low (F4 sheet section 1.2); see notes above
-               # re: the allsky bank's own f_low convention for this campaign.
+  flow: 45.0   # Fallback for legs without their own banks.<name>.flow (currently just
+               # the combined "all"/ALL leg -- allsky/ssm are explicit above, WP7 NB-1 fix).
 
 tidal:
   ffinal_mode: disruption   # EXPLICIT default -- see header note. Alternatives: contact, isco.

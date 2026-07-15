@@ -79,16 +79,31 @@ Required top-level keys (dotted paths):
                                        n_total, njobs, injections_per_job
   banks                             dict: every name in run.banks must be a key here,
                                        each entry needs at least `path`
-  psd.flow                          float
   psd.instrument                    str
   psd.reference_psd OR psd.noise_model   (at least one required)
   condor.accounting_group           str
   condor.container_image            str (osdf:// URL on a production config)
   output.dir                        str
 
+  Per-leg --flow: every (injection block, bank) pair ("leg") needs a resolvable
+  --flow, taken from banks.<name>.flow if set, else the global psd.flow. At
+  least one of the two must be set for each leg actually used, or config
+  validation fails with a clear per-leg error. There is no hardcoded flow
+  convention -- PyCBC/MBTA banks may use their own f_low; set it explicitly
+  per bank rather than relying on a global default meant for a different bank.
+
 Optional (defaults shown):
   run.apply_no_ilwdchar             true
   run.emit_plot                     true
+  psd.flow                          (none -- fallback for any bank leg without
+                                       its own banks.<name>.flow; see above)
+  banks.<name>.flow                 (none -- per-bank override of psd.flow,
+                                       emitted verbatim into that bank's --flow)
+  banks.<name>.fhigh_max            (none -- per-bank --fhigh-max override)
+  banks.<name>.tag                  (defaults to the bank's dict key -- display
+                                       casing used in the emitted directory/job/
+                                       file names, e.g. tag: SSM for key ssm, to
+                                       match historical campaign directory casing)
   condor.accounting_group_user      (none)
   condor.request_memory             3999
   condor.request_disk               "4096MB"
@@ -164,7 +179,6 @@ def _get(cfg, dotted, default="__MISSING__"):
 
 _REQUIRED_SCALAR_KEYS = [
     "run.name",
-    "psd.flow",
     "psd.instrument",
     "condor.accounting_group",
     "condor.container_image",
@@ -256,6 +270,28 @@ def validate_schema(cfg):
     has_psd = _get(cfg, "psd.reference_psd") != "__MISSING__" or _get(cfg, "psd.noise_model") != "__MISSING__"
     if not has_psd:
         errors.append("psd section needs at least one of 'reference_psd' or 'noise_model'")
+
+    # Per-bank flow (P1, NB-1): each (injection block, bank) leg needs a
+    # resolvable --flow -- either its own banks.<name>.flow or the global
+    # psd.flow. No convention is hardcoded here (PyCBC/MBTA banks may define
+    # their own f_low); a leg that resolves neither is a clear config error,
+    # not a silent fall-through to some GstLAL-specific default.
+    global_flow = _get(cfg, "psd.flow")
+    for i, block in enumerate(injections):
+        if not isinstance(block, dict):
+            continue
+        block_banks = block.get("banks", banks_used)
+        if not isinstance(block_banks, list):
+            continue
+        for name in block_banks:
+            entry = bank_table.get(name)
+            if not isinstance(entry, dict):
+                continue  # already reported above as an undefined bank
+            if entry.get("flow") is None and global_flow == "__MISSING__":
+                errors.append(
+                    "injections[%d] ('%s') bank '%s': no resolvable --flow "
+                    "(set banks.%s.flow or the global psd.flow)"
+                    % (i, block.get("name"), name, name))
 
     if errors:
         raise ConfigError(
@@ -445,10 +481,21 @@ def build_plan(cfg, user_tag=None):
             bank_approx = bank_entry.get("approximant")
             template_bank_arg = ("%s:%s" % (bank_path, bank_approx)
                                   if bank_approx else bank_path)
+            # P1 (NB-1): per-bank flow override, user-specified as data --
+            # falls back to the global psd.flow when a bank doesn't set its
+            # own (validate_schema already guarantees one of the two exists
+            # for every leg actually used).
+            bank_flow = bank_entry.get("flow", psd_cfg.get("flow"))
+            bank_fhigh_max = bank_entry.get("fhigh_max")
+            # P2 (NB-2): display casing for dirs/tags/node names -- defaults
+            # to the bank's own YAML key, but a bank entry may set `tag:` to
+            # match a historical/external naming convention (e.g. tag: SSM
+            # for the ssm key) without the generator hardcoding that mapping.
+            bank_tag = _sanitize(str(bank_entry.get("tag", bank_name)))
 
-            job_tag = "banksim_%s_%s" % (injname, _sanitize(bank_name))
+            job_tag = "banksim_%s_%s" % (injname, bank_tag)
             sub = plan.add_sub(SubFile(job_tag, sbank_sim_exe))
-            sub.initialdir = os.path.join(output_dir_analysis, "%s_%s" % (injname, bank_name))
+            sub.initialdir = os.path.join(output_dir_analysis, "%s_%s" % (injname, bank_tag))
             _condor_resource_cmds(sub, condor_cfg)
             _condor_accounting_cmds(sub, condor_cfg)
             static_inputs = [inj_file, bank_path]
@@ -468,7 +515,9 @@ def build_plan(cfg, user_tag=None):
                 sub.add_opt("instrument", psd_cfg["instrument"])
             elif psd_cfg.get("noise_model"):
                 sub.add_opt("noise-model", psd_cfg["noise_model"])
-            sub.add_opt("flow", psd_cfg["flow"])
+            sub.add_opt("flow", bank_flow)
+            if bank_fhigh_max is not None:
+                sub.add_opt("fhigh-max", bank_fhigh_max)
             if tidal_cfg:
                 sub.add_opt("tidal-lambda-columns", tidal_cfg.get("lambda_columns", "alpha:alpha1"))
                 sub.add_opt("tidal-ffinal-mode", tidal_cfg.get("ffinal_mode", "disruption"))
@@ -478,8 +527,8 @@ def build_plan(cfg, user_tag=None):
 
             bank_node_names = []
             for j in range(njobs):
-                tag = "SBANK_SIM_%s_%s_%05d" % (injname, bank_name, j)
-                node_name = "SIM_%s_%s_%05d" % (injname, _sanitize(bank_name), j)
+                tag = "SBANK_SIM_%s_%s_%05d" % (injname, bank_tag, j)
+                node_name = "SIM_%s_%s_%05d" % (injname, bank_tag, j)
                 node = DagNode(node_name, sub, vars_={
                     "injmin": j * ninj, "injmax": (j + 1) * ninj, "tag": tag,
                 })
@@ -490,7 +539,7 @@ def build_plan(cfg, user_tag=None):
 
             if emit_plot:
                 plot_sub = plan.add_sub(SubFile(
-                    "plot_%s_%s" % (injname, _sanitize(bank_name)),
+                    "plot_%s_%s" % (injname, bank_tag),
                     condor_cfg.get("sbank_plot_sim_executable", "sbank_plot_sim"),
                     universe="local"))
                 _condor_resource_cmds(plot_sub, {"request_memory": 3999,
@@ -499,8 +548,8 @@ def build_plan(cfg, user_tag=None):
                 _condor_accounting_cmds(plot_sub, condor_cfg)
                 plot_sub.initialdir = sub.initialdir
                 for j in range(njobs):
-                    plot_sub.add_arg("SBANK_SIM_%s_%s_%05d.h5" % (injname, bank_name, j))
-                plot_node = DagNode("PLOT_%s_%s" % (injname, _sanitize(bank_name)), plot_sub)
+                    plot_sub.add_arg("SBANK_SIM_%s_%s_%05d.h5" % (injname, bank_tag, j))
+                plot_node = DagNode("PLOT_%s_%s" % (injname, bank_tag), plot_sub)
                 plot_node.parents.extend(bank_node_names)
                 plan.add_node(plot_node)
 

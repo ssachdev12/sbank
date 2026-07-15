@@ -68,16 +68,29 @@ banks:
     path: "{{BANK_PATH_ALLSKY}}"
     # approximant left unset: allsky BNS bank is TaylorF2 by convention for this scenario;
     # sbank_sim uses the bank's own approximant column if none is given here.
+    flow: 15.0   # GstLAL O4 stellar/allsky match-integral f_low convention (F4 sheet
+                 # section 1.2). Explicit per-bank data, not a generator-hardcoded default.
   ssm:
     path: "{{BANK_PATH_SSM}}"
+    tag: SSM     # historical campaign directory/tag casing (WP7 NB-2) -- matches
+                 # 01_consolidate_banksim.py's SCENARIOS globs (e.g. alignedlowspinBNS_SSM/)
+    flow: 45.0   # GstLAL O4 SSM match-integral f_low convention (F4 sheet section 1.2) --
+                 # per-bank override so the SSM leg no longer inherits the allsky f_low
+                 # (WP7 NB-1: previously this leg silently ran at 15 Hz instead of 45 Hz).
   all:
     path: "{{BANK_PATH_ALL}}"
+    tag: ALL     # historical campaign directory/tag casing (WP7 NB-2)
+    # No per-bank flow override: this combined-bank ("ALL") leg falls back to the
+    # global psd.flow below. F4 does not specify a distinct f_low convention for the
+    # combined-bank match integral; this is an open item for the follow-up plan
+    # (see READINESS.md's "what the follow-up plan needs" list).
 
 psd:
   reference_psd: "{{PSD_PATH}}"   # same O4 Advanced LIGO PSD as the existing BNS study
   instrument: L1
-  flow: 15.0    # stellar/allsky match-integral f_low (SSM band uses 45 Hz -- see
-                # 01_consolidate_banksim.py's band-power scaling, not reproduced here)
+  flow: 15.0    # Fallback f_low for any bank leg without its own banks.<name>.flow --
+                # currently only the combined "all"/ALL leg (see banks.all note above).
+                # allsky/ssm now carry their own explicit per-bank flow (WP7 NB-1 fix).
 
 eccentric:
   ecc_columns: "alpha2:alpha3"   # matches bin/sbank_sim's --ecc-columns default transport
