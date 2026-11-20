@@ -999,6 +999,13 @@ class NRTidalAlignedSpinTemplate(TidalAlignedSpinTemplate, IMRAlignedSpinTemplat
     series checks below remain authoritative backstops.
     """
 
+    def __init__(self, m1, m2, spin1z, spin2z, lambda1, lambda2, bank,
+                 flow=None, duration=None):
+        self.bank = bank
+        super(NRTidalAlignedSpinTemplate, self).__init__(
+            m1, m2, spin1z, spin2z, lambda1, lambda2, bank,
+            flow=flow, duration=duration)
+
     def _get_f_final(self):
         return IMRAlignedSpinTemplate._get_f_final(self)
 
@@ -1013,10 +1020,11 @@ class NRTidalAlignedSpinTemplate(TidalAlignedSpinTemplate, IMRAlignedSpinTemplat
                 raise ValueError("IMRPhenomXAS_NRTidalv3 kappa2T=%g exceeds the safe "
                                  "limit 60000; waveform generation would risk NaNs" % kappa2t)
         approx = lalsim.GetApproximantFromString(self.approximant)
+        f_ref = self.bank.inj_f_ref if self.bank.inj_f_ref else self.flow
         hplus_fd, _ = lalsim.SimInspiralChooseFDWaveform(
             self.m1*MSUN_SI, self.m2*MSUN_SI, 0., 0., self.spin1z,
             0., 0., self.spin2z, 1.e6*PC_SI, 0., 0., 0., 0., 0.,
-            df, self.flow, f_final, self.flow, self._tidal_laldict(), approx)
+            df, self.flow, f_final, f_ref, self._tidal_laldict(), approx)
         if hplus_fd.data.length == 0:
             raise ValueError("%s returned an empty waveform for Lambda=(%g, %g)" %
                              (self.approximant, self.lambda1, self.lambda2))
@@ -1059,6 +1067,7 @@ class PrecessingSpinTemplate(AlignedSpinTemplate):
                  theta, phi, iota, psi, orb_phase, bank, flow=None,
                  duration=None):
 
+        self.bank = bank
         AlignedSpinTemplate.__init__(self, m1, m2, spin1z, spin2z, bank,
                                      flow=flow, duration=duration)
         self.spin1x = float(spin1x)
@@ -1075,7 +1084,7 @@ class PrecessingSpinTemplate(AlignedSpinTemplate):
         outs = lalsim.SimIMRPhenomPCalculateModelParametersFromSourceFrame(
             self.m1,
             self.m2,
-            self.flow,
+            self.bank.inj_f_ref if self.bank.inj_f_ref else self.flow,
             self.orb_phase,
             self.iota,
             self.spin1x,
@@ -1109,6 +1118,7 @@ class PrecessingSpinTemplate(AlignedSpinTemplate):
 
     def _compute_waveform_comps(self, df, f_final):
         approx = lalsim.GetApproximantFromString(self.approximant)
+        f_ref = self.bank.inj_f_ref if self.bank.inj_f_ref else self.flow
         if lalsim.SimInspiralImplementedFDApproximants(approx):
             hplus_fd, hcross_fd = lalsim.SimInspiralChooseFDWaveform(
                 self.m1*MSUN_SI, self.m2*MSUN_SI,
@@ -1116,7 +1126,7 @@ class PrecessingSpinTemplate(AlignedSpinTemplate):
                 self.spin2x, self.spin2y, self.spin2z,
                 1.e6*PC_SI, self.iota, self.orb_phase,
                 0., 0., 0.,
-                df, self.flow, f_final, self.flow,
+                df, self.flow, f_final, f_ref,
                 None, approx)
         else:
             hplus_fd, hcross_fd = lalsim.SimInspiralFD(
@@ -1125,7 +1135,7 @@ class PrecessingSpinTemplate(AlignedSpinTemplate):
                 self.spin2x, self.spin2y, self.spin2z,
                 1.e6*PC_SI, self.iota, self.orb_phase,
                 0., 0., 0.,
-                df, self.flow, f_final, self.flow,
+                df, self.flow, f_final, f_ref,
                 None, approx)
 
         return hplus_fd, hcross_fd
@@ -1419,12 +1429,13 @@ class IMRPhenomXPNRTidalv2Template(IMRPrecessingSpinTemplate):
 
     def _compute_waveform_comps(self, df, f_final):
         approx = lalsim.GetApproximantFromString(self.approximant)
+        f_ref = self.bank.inj_f_ref if self.bank.inj_f_ref else self.flow
         hplus_fd, hcross_fd = lalsim.SimInspiralChooseFDWaveform(
             self.m1*MSUN_SI, self.m2*MSUN_SI,
             self.spin1x, self.spin1y, self.spin1z,
             self.spin2x, self.spin2y, self.spin2z,
             1.e6*PC_SI, self.iota, self.orb_phase, 0., 0., 0.,
-            df, self.flow, f_final, self.flow, self._tidal_laldict(), approx)
+            df, self.flow, f_final, f_ref, self._tidal_laldict(), approx)
         if hplus_fd.data.length == 0 or hcross_fd.data.length == 0:
             raise ValueError("%s returned an empty waveform for Lambda=(%g, %g)" %
                              (self.approximant, self.lambda1, self.lambda2))
@@ -1448,6 +1459,24 @@ class IMRPhenomXPNRTidalv2Template(IMRPrecessingSpinTemplate):
             row[name] = base[name]
         row['lambda1'], row['lambda2'] = self.lambda1, self.lambda2
         return row
+
+
+class IMRPhenomXPNRTidalv3Template(IMRPhenomXPNRTidalv2Template):
+    """Injection-only precessing NRTidalv3 waveform.
+
+    LALSimulation 6.2.1 implements IMRPhenomXP_NRTidalv3 (enum 116) in the
+    frequency domain.  The kappa2T <= 60000 guard is an sbank safety choice,
+    not a LAL limit.  Parameter transport and series checks are inherited.
+    """
+    approximant = "IMRPhenomXP_NRTidalv3"
+
+    def _compute_waveform_comps(self, df, f_final):
+        kappa2t = lalsim.SimNRTunedTidesComputeKappa2T(
+            self.m1*MSUN_SI, self.m2*MSUN_SI, self.lambda1, self.lambda2)
+        if kappa2t > 6.e4:
+            raise ValueError("IMRPhenomXP_NRTidalv3 kappa2T=%g exceeds the safe "
+                             "limit 60000; waveform generation would risk NaNs" % kappa2t)
+        return super(IMRPhenomXPNRTidalv3Template, self)._compute_waveform_comps(df, f_final)
 
 
 class HigherOrderModeTemplate(PrecessingSpinTemplate):
@@ -1573,6 +1602,7 @@ waveforms = {
     "IMRPhenomXPHM": IMRPhenomXPHMTemplate,
     "IMRPhenomXO4a": IMRPhenomXO4aTemplate,
     "IMRPhenomXP_NRTidalv2": IMRPhenomXPNRTidalv2Template,
+    "IMRPhenomXP_NRTidalv3": IMRPhenomXPNRTidalv3Template,
     "IMRPhenomXAS": IMRPhenomXASTemplate,
     "SEOBNRv2": SEOBNRv2Template,
     "SEOBNRv2_ROM_DoubleSpin": SEOBNRv2ROMDoubleSpinTemplate,

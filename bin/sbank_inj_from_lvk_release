@@ -1,0 +1,422 @@
+#!/usr/bin/env python
+"""Convert an LVK search-sensitivity injection release into a sim_inspiral XML.
+
+What
+----
+Reads the ``events`` compound dataset of an LVK O4 search-sensitivity
+injection file (e.g. the O4a release, Zenodo 10.5281/zenodo.19338460) and
+writes a LIGO_LW document (process + process_params + sim_inspiral tables)
+that ``bin/sbank_sim --injection-file`` can load, so fitting factors can be
+computed on the release's own injection parameters.  Every row of ``events``
+in ``[--row-start, --row-stop)`` is written, in file order; the release row
+index (position in ``events``) is carried in ``alpha4`` so results can be
+joined back to the release after ``sbank_sim`` re-sorts injections by chirp
+mass.
+
+Column mapping (release -> sim_inspiral)
+    mass1, mass2      mass{1,2}_detector (default; the search filters
+                      detector-frame, i.e. redshifted, masses) or
+                      mass{1,2}_source with ``--masses source``.
+                      mchirp and eta are computed from the written masses.
+    spins             aligned:    spin1z, spin2z copied as-is (the
+                                  z-components, NOT the spin magnitudes);
+                                  spin{1,2}{x,y} set to 0.
+                      precessing: all six Cartesian components copied.
+    inclination, coa_phase   copied.
+    distance          luminosity_distance [Mpc] if finite, else 1.0 (counted).
+    geocent_end_time(_ns)    time_geocenter (split into s + ns); h_end_time,
+                      l_end_time get the same value; end_time_gmst = GMST.
+    f_lower           fref.
+    waveform          approximant (bytes decoded to str).
+    alpha, alpha1     tidal_deformability1, tidal_deformability2 (default
+                      ``--lambda-columns alpha:alpha1``, matching sbank_sim's
+                      ``--tidal-lambda-columns`` default) when those release
+                      columns exist, else 0.0.  NaN lambdas -> 0.0 (counted).
+                      ``--set bns`` requires the tidal columns.
+    alpha2, alpha3    eccentricity (0 if non-finite) and mean anomaly 0.0, the
+                      sbank_sim ``--ecc-columns`` default transport.
+    alpha4            release row index (as float; exact up to 2**24).
+    alpha5            snr_net (network optimal SNR from the release; -1.0 if
+                      non-finite), handy for later selection.
+    simulation_id     sequential from 0 in written order.
+
+Sky location and polarisation (detector-frame conversion)
+    sbank's ``project_hplus_hcross`` applies an idealised antenna pattern in
+    the DETECTOR frame, with theta = pi/2 - latitude and phi = longitude
+    (no GMST, no detector tensor):
+        Fp' = 1/2 (1 + cos^2 theta) cos 2phi cos 2psi - cos theta sin 2phi sin 2psi
+        Fc' = 1/2 (1 + cos^2 theta) cos 2phi sin 2psi + cos theta sin 2phi cos 2psi
+    For each row we compute the real response of the chosen detector
+    (``--ifo``, default L1):
+        gmst   = GreenwichMeanSiderealTime(time_geocenter)
+        Fp, Fc = ComputeDetAMResponse(det.response, ra, dec, psi, gmst)
+    and write latitude = pi/2 (theta = 0), longitude = 0 (phi = 0) and
+    polarization psi' = 1/2 atan2(Fc, Fp).  With theta = phi = 0 sbank's
+    pattern reduces to Fp' = cos 2psi', Fc' = sin 2psi', i.e.
+    (Fp', Fc') = (Fp, Fc) / sqrt(Fp^2 + Fc^2), which reproduces the
+    detector's h+/hx mixing exactly.  The lost overall factor
+    sqrt(Fp^2 + Fc^2) only scales the amplitude, which drops out of the
+    normalised match.  (Real-4 storage of latitude leaves theta ~ 4e-8 rad,
+    an O(1e-15) effect.)  Only precessing/HM sbank waveform classes use these
+    angles; aligned-spin dominant-mode matches are insensitive to them.
+
+    kappa2T (NRTidal tidal parameter) is computed for every row with
+    lambdas using lalsimulation.SimNRTunedTidesComputeKappa2T; the summary
+    reports how many exceed 6e4, the guard above which sbank refuses
+    IMRPhenomX*_NRTidalv3 (NaN onset near 7.4e4).
+
+Inputs
+------
+``--input``  LVK release HDF5 with an ``events`` compound dataset (only the
+             needed fields are read, one at a time).
+
+Outputs
+-------
+``--output``     LIGO_LW XML (gzip if it ends in .gz) with process,
+                 process_params (all options, input md5, rows written,
+                 detector, h5py/lal/lalsimulation/igwn_ligolw versions) and
+                 sim_inspiral tables.
+``--index-csv``  optional CSV ``simulation_id,release_row,mass1,mass2,approximant``.
+A summary (rows, mass ranges, spin mode, NaN-lambda and kappa2T > 6e4
+counts, md5) is printed to stdout.
+
+Usage
+-----
+    sbank_inj_from_lvk_release --input FILE.hdf --output OUT.xml.gz \\
+        --set {bns,bbh} --spin-mode {aligned,precessing} \\
+        [--masses {detector,source}] [--ifo {H1,L1,V1}] \\
+        [--row-start I] [--row-stop J] [--lambda-columns alpha:alpha1] \\
+        [--index-csv PATH]
+"""
+
+from __future__ import (division, print_function)
+
+import os
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
+import argparse
+import csv
+import hashlib
+import sys
+
+import h5py
+import numpy as np
+
+import lal
+import lalsimulation as lalsim
+import igwn_ligolw
+from igwn_ligolw import ligolw, lsctables, utils as ligolw_utils
+
+PROGRAM = "sbank_inj_from_lvk_release"
+KAPPA2T_GUARD = 6e4
+DETECTORS = {"H1": lal.LALDetectorIndexLHODIFF,
+             "L1": lal.LALDetectorIndexLLODIFF,
+             "V1": lal.LALDetectorIndexVIRGODIFF}
+# sim_inspiral columns this tool fills itself; --lambda-columns may not use them
+RESERVED_COLUMNS = ("alpha2", "alpha3", "alpha4", "alpha5")
+
+
+def parse_command_line(argv=None):
+    parser = argparse.ArgumentParser(
+        prog=PROGRAM,
+        description="Convert an LVK search-sensitivity injection HDF5 "
+                    "release into a sim_inspiral XML for sbank_sim.")
+    parser.add_argument("--input", required=True, metavar="FILE.hdf",
+                        help="LVK release HDF5 with an 'events' dataset")
+    parser.add_argument("--output", required=True, metavar="OUT.xml.gz",
+                        help="output LIGO_LW XML (gzipped if it ends in .gz)")
+    parser.add_argument("--set", required=True, choices=("bns", "bbh"),
+                        help="release population; bns requires the "
+                             "tidal_deformability columns")
+    parser.add_argument("--spin-mode", required=True,
+                        choices=("aligned", "precessing"),
+                        help="aligned: copy spin z-components, zero in-plane; "
+                             "precessing: copy all six components")
+    parser.add_argument("--masses", choices=("detector", "source"),
+                        default="detector",
+                        help="mass frame written to mass1/mass2 "
+                             "(default: detector, what the search sees)")
+    parser.add_argument("--ifo", choices=sorted(DETECTORS), default="L1",
+                        help="detector whose antenna response sets the "
+                             "h+/hx mixing angle (default: L1)")
+    parser.add_argument("--row-start", type=int, default=0, metavar="I",
+                        help="first release row to convert (default: 0)")
+    parser.add_argument("--row-stop", type=int, default=None, metavar="J",
+                        help="stop before this release row (default: end)")
+    parser.add_argument("--lambda-columns", default="alpha:alpha1",
+                        metavar="COL1:COL2",
+                        help="sim_inspiral columns receiving Lambda1, Lambda2 "
+                             "(default: alpha:alpha1)")
+    parser.add_argument("--index-csv", default=None, metavar="PATH",
+                        help="also write simulation_id,release_row,mass1,"
+                             "mass2,approximant for the rows written")
+    opts = parser.parse_args(argv)
+
+    cols = opts.lambda_columns.split(":")
+    valid = lsctables.SimInspiralTable.validcolumns
+    if len(cols) != 2 or cols[0] == cols[1]:
+        parser.error("--lambda-columns must have the form COL1:COL2")
+    for col in cols:
+        if col not in valid or valid[col] not in ("real_4", "real_8"):
+            parser.error("--lambda-columns: %r is not a real sim_inspiral "
+                         "column" % col)
+        if col in RESERVED_COLUMNS:
+            parser.error("--lambda-columns: %r is reserved (alpha2/alpha3 "
+                         "eccentricity, alpha4 release row, alpha5 snr_net)"
+                         % col)
+    opts.lambda_cols = tuple(cols)
+    if opts.row_start < 0:
+        parser.error("--row-start must be >= 0")
+    if opts.row_stop is not None and opts.row_stop <= opts.row_start:
+        parser.error("--row-stop must be greater than --row-start")
+    return opts
+
+
+def file_md5(path, blocksize=1 << 22):
+    digest = hashlib.md5()
+    with open(path, "rb") as fobj:
+        for block in iter(lambda: fobj.read(blocksize), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def read_columns(path, names, optional, start, stop):
+    """Read selected fields of /events over [start, stop) without loading the
+    whole compound dataset.  Returns (dict, n_total_rows, stop)."""
+    out = {}
+    with h5py.File(path, "r") as h5:
+        if "events" not in h5:
+            raise ValueError("%s has no 'events' dataset" % path)
+        ev = h5["events"]
+        fields = ev.dtype.names or ()
+        nrows = ev.shape[0]
+        stop = nrows if stop is None else min(stop, nrows)
+        if start >= stop:
+            raise ValueError("row range [%d, %d) is empty (file has %d rows)"
+                             % (start, stop, nrows))
+        missing = [n for n in names if n not in fields]
+        if missing:
+            raise ValueError("%s 'events' lacks required field(s): %s"
+                             % (path, ", ".join(missing)))
+        for name in list(names) + [n for n in optional if n in fields]:
+            out[name] = ev.fields(name)[start:stop]
+    return out, nrows, stop
+
+
+def split_gps(t):
+    """float GPS seconds -> (int seconds, int nanoseconds) arrays."""
+    sec = np.floor(t)
+    ns = np.rint((t - sec) * 1e9)
+    carry = ns >= 1e9
+    sec[carry] += 1
+    ns[carry] -= 1e9
+    return sec.astype(np.int64), ns.astype(np.int64)
+
+
+def main(argv=None):
+    opts = parse_command_line(argv)
+
+    mass_cols = ("mass1_%s" % opts.masses, "mass2_%s" % opts.masses)
+    spin_cols = ("spin1z", "spin2z") if opts.spin_mode == "aligned" else \
+        ("spin1x", "spin1y", "spin1z", "spin2x", "spin2y", "spin2z")
+    required = mass_cols + spin_cols + (
+        "inclination", "coa_phase", "right_ascension", "declination",
+        "polarization", "time_geocenter", "luminosity_distance", "fref",
+        "approximant", "snr_net")
+    optional = ("tidal_deformability1", "tidal_deformability2", "eccentricity")
+
+    md5 = file_md5(opts.input)
+    col, n_total, row_stop = read_columns(opts.input, required, optional,
+                                          opts.row_start, opts.row_stop)
+    nrows = row_stop - opts.row_start
+    release_row = np.arange(opts.row_start, row_stop, dtype=np.int64)
+
+    # sanity: every geometry/mass/spin/time column must be finite
+    for name in mass_cols + spin_cols + ("inclination", "coa_phase",
+                                         "right_ascension", "declination",
+                                         "polarization", "time_geocenter",
+                                         "fref"):
+        bad = ~np.isfinite(col[name])
+        if bad.any():
+            raise ValueError("%d non-finite value(s) in release field %r "
+                             "(first at row %d)"
+                             % (bad.sum(), name, release_row[bad][0]))
+
+    m1 = np.asarray(col[mass_cols[0]], dtype=np.float64)
+    m2 = np.asarray(col[mass_cols[1]], dtype=np.float64)
+    mtot = m1 + m2
+    eta = m1 * m2 / mtot**2
+    mchirp = mtot * eta**0.6
+
+    zeros = np.zeros(nrows)
+    if opts.spin_mode == "aligned":
+        spins = {"spin1x": zeros, "spin1y": zeros, "spin1z": col["spin1z"],
+                 "spin2x": zeros, "spin2y": zeros, "spin2z": col["spin2z"]}
+    else:
+        spins = {name: col[name] for name in spin_cols}
+
+    dist = np.asarray(col["luminosity_distance"], dtype=np.float64)
+    bad_dist = ~np.isfinite(dist)
+    dist = np.where(bad_dist, 1.0, dist)
+
+    has_lambda = ("tidal_deformability1" in col and
+                  "tidal_deformability2" in col)
+    if opts.set == "bns" and not has_lambda:
+        raise ValueError("--set bns but %s lacks tidal_deformability1/2"
+                         % opts.input)
+    n_nan_lambda = 0
+    n_kappa_guard = 0
+    kappa_max = float("nan")
+    if has_lambda:
+        lam1 = np.asarray(col["tidal_deformability1"], dtype=np.float64)
+        lam2 = np.asarray(col["tidal_deformability2"], dtype=np.float64)
+        nan_lam = ~(np.isfinite(lam1) & np.isfinite(lam2))
+        n_nan_lambda = int(nan_lam.sum())
+        lam1 = np.where(np.isfinite(lam1), lam1, 0.0)
+        lam2 = np.where(np.isfinite(lam2), lam2, 0.0)
+        kappa2t = np.array([
+            lalsim.SimNRTunedTidesComputeKappa2T(a * lal.MSUN_SI,
+                                                 b * lal.MSUN_SI, la, lb)
+            for a, b, la, lb in zip(m1.tolist(), m2.tolist(),
+                                    lam1.tolist(), lam2.tolist())])
+        n_kappa_guard = int((kappa2t > KAPPA2T_GUARD).sum())
+        kappa_max = float(kappa2t.max())
+    else:
+        lam1 = lam2 = zeros
+
+    ecc = col.get("eccentricity", zeros)
+    ecc = np.where(np.isfinite(ecc), ecc, 0.0)
+    snr = np.asarray(col["snr_net"], dtype=np.float64)
+    snr = np.where(np.isfinite(snr), snr, -1.0)
+
+    # detector-frame h+/hx mixing angle for sbank's idealised pattern
+    det = lal.CachedDetectors[DETECTORS[opts.ifo]]
+    gps_s, gps_ns = split_gps(np.asarray(col["time_geocenter"], np.float64))
+    ra = col["right_ascension"].tolist()
+    dec = col["declination"].tolist()
+    psi = col["polarization"].tolist()
+    gmst = np.empty(nrows)
+    psi_det = np.empty(nrows)
+    response = det.response
+    for i, (s, ns) in enumerate(zip(gps_s.tolist(), gps_ns.tolist())):
+        g = lal.GreenwichMeanSiderealTime(lal.LIGOTimeGPS(s, ns))
+        fp, fc = lal.ComputeDetAMResponse(response, ra[i], dec[i], psi[i], g)
+        gmst[i] = g
+        psi_det[i] = 0.5 * np.arctan2(fc, fp)
+
+    approx = [a.decode() if isinstance(a, bytes) else str(a)
+              for a in col["approximant"].tolist()]
+
+    # assemble sim_inspiral
+    xmldoc = ligolw.Document()
+    xmldoc.appendChild(ligolw.LIGO_LW())
+    sim_table = lsctables.SimInspiralTable.new()
+    xmldoc.childNodes[0].appendChild(sim_table)
+
+    per_row = {
+        "mass1": m1, "mass2": m2, "mchirp": mchirp, "eta": eta,
+        "inclination": col["inclination"], "coa_phase": col["coa_phase"],
+        "distance": dist, "geocent_end_time": gps_s,
+        "geocent_end_time_ns": gps_ns, "h_end_time": gps_s,
+        "h_end_time_ns": gps_ns, "l_end_time": gps_s, "l_end_time_ns": gps_ns,
+        "end_time_gmst": gmst, "f_lower": col["fref"],
+        "latitude": np.full(nrows, 0.5 * np.pi), "longitude": zeros,
+        "polarization": psi_det,
+        opts.lambda_cols[0]: lam1, opts.lambda_cols[1]: lam2,
+        "alpha2": ecc, "alpha3": zeros, "alpha4": release_row.astype(float),
+        "alpha5": snr,
+    }
+    per_row.update(spins)
+    # convert each distinct array to a Python list once, so columns sharing an
+    # array (zeros, the GPS seconds/ns) share element objects (saves memory)
+    as_list = {}
+    for key, value in per_row.items():
+        if id(value) not in as_list:
+            as_list[id(value)] = np.asarray(value).tolist()
+        per_row[key] = as_list[id(value)]
+    del as_list
+    per_row["waveform"] = approx
+    per_row["simulation_id"] = list(range(nrows))
+
+    constants = {}
+    for name, coltype in lsctables.SimInspiralTable.validcolumns.items():
+        name = name.split(":")[-1]
+        if name in per_row or name == "process_id":
+            continue
+        if coltype == "lstring":
+            constants[name] = ""
+        elif coltype.startswith("int"):
+            constants[name] = 0
+        else:
+            constants[name] = 0.0
+    constants["taper"] = "TAPER_NONE"
+
+    # register the process (needs nrows) and fill in its params
+    params = dict(vars(opts))
+    params.pop("lambda_cols")
+    params = dict((k, v) for k, v in params.items() if v is not False)
+    params.update({
+        "input_md5": md5, "n_rows_written": nrows,
+        "n_rows_in_file": n_total, "detector": opts.ifo,
+        "h5py_version": h5py.__version__, "lal_version": lal.__version__,
+        "lalsimulation_version": lalsim.__version__,
+        "igwn_ligolw_version": igwn_ligolw.__version__,
+    })
+    process = xmldoc.register_process(PROGRAM, params)
+    constants["process_id"] = process.process_id
+
+    RowType = sim_table.RowType
+    keys = list(per_row)
+    columns = [per_row[k] for k in keys]
+    const_items = list(constants.items())
+    append = sim_table.append
+    for values in zip(*columns):
+        row = RowType()
+        for k, v in const_items:
+            setattr(row, k, v)
+        for k, v in zip(keys, values):
+            setattr(row, k, v)
+        append(row)
+
+    process.set_end_time_now()
+    ligolw_utils.write_filename(xmldoc, opts.output)
+
+    if opts.index_csv:
+        with open(opts.index_csv, "w", newline="") as fobj:
+            writer = csv.writer(fobj)
+            writer.writerow(("simulation_id", "release_row", "mass1", "mass2",
+                             "approximant"))
+            for i in range(nrows):
+                writer.writerow((i, int(release_row[i]), repr(float(m1[i])),
+                                 repr(float(m2[i])), approx[i]))
+
+    approx_counts = dict(zip(*np.unique(approx, return_counts=True)))
+    print("%s summary" % PROGRAM)
+    print("  input            %s (md5 %s, %d rows in file)"
+          % (opts.input, md5, n_total))
+    print("  rows written     %d (release rows %d..%d)"
+          % (nrows, opts.row_start, row_stop - 1))
+    print("  output           %s" % opts.output)
+    print("  set / spin mode  %s / %s; masses %s-frame; detector %s"
+          % (opts.set, opts.spin_mode, opts.masses, opts.ifo))
+    print("  mass1 range      [%.6g, %.6g]" % (m1.min(), m1.max()))
+    print("  mass2 range      [%.6g, %.6g]" % (m2.min(), m2.max()))
+    print("  mchirp range     [%.6g, %.6g]" % (mchirp.min(), mchirp.max()))
+    print("  approximants     %s" % ", ".join(
+        "%s: %d" % (k, v) for k, v in sorted(approx_counts.items())))
+    print("  lambdas          %s -> %s:%s; NaN-lambda rows set to 0: %d"
+          % ("present" if has_lambda else "absent (0.0)",
+             opts.lambda_cols[0], opts.lambda_cols[1], n_nan_lambda))
+    print("  kappa2T > %g  %d (max %s)"
+          % (KAPPA2T_GUARD, n_kappa_guard,
+             "%.6g" % kappa_max if has_lambda else "n/a, no lambdas"))
+    print("  non-finite distance -> 1.0: %d; non-finite snr_net -> -1: %d"
+          % (int(bad_dist.sum()), int((~np.isfinite(col["snr_net"])).sum())))
+    if opts.index_csv:
+        print("  index csv        %s" % opts.index_csv)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

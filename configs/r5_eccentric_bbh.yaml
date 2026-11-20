@@ -49,8 +49,9 @@ injections:
 banks:
   allsky:
     path: "{{BANK_PATH_ALLSKY}}"
+    approximant: "{{BANK_APPROX_ALLSKY}}"   # required for XML banks (sbank_sim has no per-template
+                 # fallback); set with --set to the template model of the bank in use
     # BBH-region stellar bank: IMR templates (Sakon+2024/Hanna+2025), not TaylorF2 --
-    # leave approximant unset so sbank_sim honors the bank's own per-template column
     # (F4 sheet section 1.3 note / section 4.4).
 
 psd:

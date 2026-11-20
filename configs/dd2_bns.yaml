@@ -1,0 +1,48 @@
+# WP9 IGWN campaign template: transfer every input; job arguments use basenames.
+# Tidal cutoff isco matches the ALF2-era runs; lambdas travel in alpha/alpha1.
+# This fork has no --template-pn-order option (LAL default order).
+# Counts below are template values: reset n_total to the post-EOS-cut / final
+# selected injection count and njobs accordingly before submitting; each job
+# slices the shared injection file (njobs * injections_per_job = n_total).
+
+run:
+  name: DD2BNS
+  banks: [allsky, ssm, all]
+  emit_plot: false
+  apply_no_ilwdchar: false
+
+injections:
+  - name: DD2BNS
+    approximant: TaylorF2Tidal
+    injection_file: "{{INJECTION_FILE_DD2_BNS}}"
+    n_total: 100000  # MUST reset to the final selected / post-EOS-cut count.
+    njobs: 5000     # MUST reset with n_total; 20 injections per job.
+    injections_per_job: 20
+
+banks:
+  allsky: {path: "{{BANK_URL_ALLSKY}}", approximant: TaylorF2, flow: 15, fhigh_max: 1024}
+  ssm: {path: "{{BANK_URL_SSM}}", approximant: TaylorF2, flow: 45, fhigh_max: 1024, tag: SSM}
+  all: {path: "{{BANK_URL_ALL}}", approximant: TaylorF2, flow: 15, fhigh_max: 1024, tag: ALL}
+
+psd: {reference_psd: "{{PSD_PATH}}", instrument: L1}
+
+tidal: {ffinal_mode: isco, lambda_columns: "alpha:alpha1"}
+
+condor:
+  accounting_group: "{{ACCOUNTING_TAG}}"
+  accounting_group_user: "{{ACCOUNTING_USER}}"
+  container_image: "osdf:///{{CONTAINER_OSDF_PATH}}/sbank-igwn.sif"
+  sbank_sim_executable: /opt/conda/envs/sbank-igwn/bin/sbank_sim
+  request_memory: "{{REQUEST_MEMORY}}"
+  request_disk: "4096MB"
+  request_cpus: 1
+  should_transfer_files: true
+  extra_submit:
+    - "requirements = (HAS_SINGULARITY =?= True)"
+    - "{{EXTRA_SUBMIT_1}}"
+
+sbank_sim:
+  extra_args: ["--neighborhood-size 1", "--neighborhood-param tau0"]
+
+output: {dir: "{{OUTPUT_DIR}}"}
+

@@ -63,6 +63,8 @@ injections:
 banks:
   allsky:
     path: "{{BANK_PATH_ALLSKY}}"
+    approximant: "{{BANK_APPROX_ALLSKY}}"   # required for XML banks (sbank_sim has no per-template
+                 # fallback); set with --set to the template model of the bank in use
 
 psd:
   reference_psd: "{{PSD_PATH}}"

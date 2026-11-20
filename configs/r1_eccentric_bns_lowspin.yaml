@@ -66,12 +66,12 @@ injections:
 banks:
   allsky:
     path: "{{BANK_PATH_ALLSKY}}"
-    # approximant left unset: allsky BNS bank is TaylorF2 by convention for this scenario;
-    # sbank_sim uses the bank's own approximant column if none is given here.
+    approximant: TaylorF2   # required for XML banks: sbank_sim has no per-template fallback
     flow: 15.0   # GstLAL O4 stellar/allsky match-integral f_low convention (F4 sheet
                  # section 1.2). Explicit per-bank data, not a generator-hardcoded default.
   ssm:
     path: "{{BANK_PATH_SSM}}"
+    approximant: TaylorF2   # required for XML banks: sbank_sim has no per-template fallback
     tag: SSM     # historical campaign directory/tag casing (WP7 NB-2) -- matches
                  # 01_consolidate_banksim.py's SCENARIOS globs (e.g. alignedlowspinBNS_SSM/)
     flow: 45.0   # GstLAL O4 SSM match-integral f_low convention (F4 sheet section 1.2) --
@@ -79,6 +79,7 @@ banks:
                  # (WP7 NB-1: previously this leg silently ran at 15 Hz instead of 45 Hz).
   all:
     path: "{{BANK_PATH_ALL}}"
+    approximant: TaylorF2   # required for XML banks: sbank_sim has no per-template fallback
     tag: ALL     # historical campaign directory/tag casing (WP7 NB-2)
     # No per-bank flow override: this combined-bank ("ALL") leg falls back to the
     # global psd.flow below. F4 does not specify a distinct f_low convention for the

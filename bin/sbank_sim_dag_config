@@ -58,6 +58,7 @@ import argparse
 import os
 import re
 import sys
+from urllib.parse import urlsplit
 
 try:
     import yaml
@@ -93,13 +94,16 @@ Required top-level keys (dotted paths):
   per bank rather than relying on a global default meant for a different bank.
 
 Optional (defaults shown):
-  run.apply_no_ilwdchar             true
-  run.emit_plot                     true
+  run.apply_no_ilwdchar             false
+  run.emit_plot                     false
   psd.flow                          (none -- fallback for any bank leg without
                                        its own banks.<name>.flow; see above)
   banks.<name>.flow                 (none -- per-bank override of psd.flow,
                                        emitted verbatim into that bank's --flow)
   banks.<name>.fhigh_max            (none -- per-bank --fhigh-max override)
+  banks.<name>.approximant          required unless path ends in .h5/.hdf/.hdf5;
+                                       XML banks use LOCALNAME:APPROX in transfer mode
+  banks.<name>.extra_args           [] (list of strings; appended verbatim)
   banks.<name>.tag                  (defaults to the bank's dict key -- display
                                        casing used in the emitted directory/job/
                                        file names, e.g. tag: SSM for key ssm, to
@@ -110,15 +114,32 @@ Optional (defaults shown):
   condor.request_cpus               1
   condor.should_transfer_files      true
   condor.extra_input_files          []
-  condor.sbank_sim_executable       "sbank_sim"
+  condor.extra_submit               [] (list of raw submit lines, appended verbatim
+                                       after container lines on every sbank_sim sub)
+  condor.getenv                     (none -- optional string; no environment imported
+                                       unless explicitly set)
+  condor.sbank_sim_executable       "/opt/conda/envs/sbank-igwn/bin/sbank_sim"
   condor.no_ilwdchar_executable     "ligolw_no_ilwdchar"
   output.log_dir                    <output.dir>/logs
   tidal.ffinal_mode / tidal.lambda_columns          (only for tidal runs)
+  injections[].tidal                overrides the global tidal block; null disables
+                                       tidal options for this block (e.g. LVK BBH)
   eccentric.ecc_columns / eccentric.ecc_f_ref       (only for eccentric runs)
   injections[].control_block        {job_start, job_end, note}
   injections[].params               free-form self-documentation (draw distributions)
   injections[].banks                override run.banks for this block only (e.g. a
                                        cross-check block that only runs against one bank)
+  injections[].extra_args           [] (list of strings; appended verbatim)
+  sbank_sim.extra_args               [] (list of strings; appended verbatim in order:
+                                       global, bank, injection)
+
+Transfer mode (default): input arguments use bare basenames, transfer_input_files
+keeps full paths/URLs, transfer_executable is false, and only $(tag).h5 is returned.
+With condor.should_transfer_files: false, arguments keep full shared-filesystem paths.
+Every submit initialdir and its logs directory are created; relative initialdirs
+are relative to --output-dir (submit the DAG from that directory).
+Injection counts are integers, with njobs * injections_per_job = n_total; jobs
+slice one shared injection file using --injection-min/--injection-max.
 """
 
 
@@ -194,6 +215,19 @@ _REQUIRED_INJECTION_KEYS = [
 def validate_schema(cfg):
     errors = []
 
+    def string_list(value, key):
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            errors.append("%s must be a list of strings" % key)
+
+    missing = object()
+    for key in ("condor.extra_submit", "sbank_sim.extra_args"):
+        value = _get(cfg, key, missing)
+        if value is not missing:
+            string_list(value, key)
+    getenv = _get(cfg, "condor.getenv")
+    if getenv != "__MISSING__" and not isinstance(getenv, str):
+        errors.append("condor.getenv must be a string")
+
     for key in _REQUIRED_SCALAR_KEYS:
         if _get(cfg, key) == "__MISSING__":
             errors.append("missing required key '%s'" % key)
@@ -210,8 +244,18 @@ def validate_schema(cfg):
     for name in banks_used:
         if name not in bank_table:
             errors.append("run.banks refers to bank '%s' but 'banks.%s' is not defined" % (name, name))
-        elif "path" not in bank_table.get(name, {}):
+    for name, entry in bank_table.items():
+        if not isinstance(entry, dict):
+            errors.append("banks.%s must be a mapping" % name)
+            continue
+        if "path" not in entry:
             errors.append("banks.%s is missing required key 'path'" % name)
+        elif (not str(entry["path"]).lower().endswith((".h5", ".hdf", ".hdf5"))
+              and not entry.get("approximant")):
+            errors.append(
+                "banks.%s.approximant is required for non-HDF banks (including XML)" % name)
+        if "extra_args" in entry:
+            string_list(entry["extra_args"], "banks.%s.extra_args" % name)
 
     injections = _get(cfg, "injections")
     if not injections or not isinstance(injections, list):
@@ -225,6 +269,10 @@ def validate_schema(cfg):
         for key in _REQUIRED_INJECTION_KEYS:
             if key not in block:
                 errors.append("injections[%d] is missing required key '%s'" % (i, key))
+        if "extra_args" in block:
+            string_list(block["extra_args"], "injections[%d].extra_args" % i)
+        if block.get("tidal") is not None and not isinstance(block["tidal"], dict):
+            errors.append("injections[%d].tidal must be a mapping or null" % i)
         # Per-block bank override (e.g. R1's cross-check block runs against
         # the allsky bank only, unlike the primary block's allsky+SSM+ALL) --
         # optional; falls back to run.banks when absent.
@@ -338,12 +386,14 @@ class SubFile(object):
     def render(self):
         lines = ["universe = %s" % self.universe,
                   "executable = %s" % self.executable]
+        if self.universe == "vanilla":
+            lines.append("transfer_executable = false")
         if self.initialdir:
             lines.append("initialdir = %s" % self.initialdir)
         if self.arguments:
             lines.append('arguments = "%s"' % " ".join(self.arguments))
         for key, value in self.condor_cmds:
-            lines.append("%s = %s" % (key, value))
+            lines.append(key if value is None else "%s = %s" % (key, value))
         lines.append("log = %s" % self.log)
         lines.append("output = %s" % self.output)
         lines.append("error = %s" % self.error)
@@ -395,6 +445,10 @@ class DagPlan(object):
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(os.path.join(output_dir, "logs"), exist_ok=True)
         for sub in self.subs.values():
+            initialdir = sub.initialdir or "."
+            if not os.path.isabs(initialdir):
+                initialdir = os.path.join(output_dir, initialdir)
+            os.makedirs(os.path.join(initialdir, "logs"), exist_ok=True)
             with open(os.path.join(output_dir, sub.filename()), "w") as fh:
                 fh.write(sub.render())
         with open(os.path.join(output_dir, "%s.dag" % self.basename), "w") as fh:
@@ -415,6 +469,7 @@ def _condor_accounting_cmds(sub, condor_cfg):
 
 def _condor_transfer_cmds(sub, condor_cfg, input_files):
     if not condor_cfg.get("should_transfer_files", True):
+        sub.add_cmd("should_transfer_files", "NO")
         return
     sub.add_cmd("should_transfer_files", "YES")
     sub.add_cmd("when_to_transfer_output", "ON_EXIT_OR_EVICT")
@@ -432,7 +487,18 @@ def _condor_container_cmds(sub, condor_cfg):
     # not verified against a live IGWN submit host from this environment).
     sub.add_cmd("container_image", image)
     sub.add_cmd("+SingularityImage", '"%s"' % image)
-    sub.add_cmd("getenv", "OMP_NUM_THREADS,OPENBLAS_NUM_THREADS")
+
+
+def _condor_extra_cmds(sub, condor_cfg):
+    if "getenv" in condor_cfg:
+        sub.add_cmd("getenv", condor_cfg["getenv"])
+    for line in condor_cfg.get("extra_submit", []):
+        sub.add_cmd(line, None)
+
+
+def _job_local_name(path_or_url):
+    """HTCondor stages local paths and URL path components by basename."""
+    return os.path.basename(urlsplit(path_or_url).path)
 
 
 def build_plan(cfg, user_tag=None):
@@ -442,15 +508,15 @@ def build_plan(cfg, user_tag=None):
     condor_cfg = cfg.get("condor", {})
     psd_cfg = cfg["psd"]
     output_dir_analysis = cfg["output"]["dir"]
-    tidal_cfg = cfg.get("tidal")
     ecc_cfg = cfg.get("eccentric")
-    apply_no_ilwdchar = run.get("apply_no_ilwdchar", True)
-    emit_plot = run.get("emit_plot", True)
+    apply_no_ilwdchar = run.get("apply_no_ilwdchar", False)
+    emit_plot = run.get("emit_plot", False)
     banks_used = run["banks"]
     bank_table = cfg["banks"]
 
-    sbank_sim_exe = condor_cfg.get("sbank_sim_executable", "sbank_sim")
+    sbank_sim_exe = condor_cfg.get("sbank_sim_executable", "/opt/conda/envs/sbank-igwn/bin/sbank_sim")
     no_ilwdchar_exe = condor_cfg.get("no_ilwdchar_executable", "ligolw_no_ilwdchar")
+    job_path = _job_local_name if condor_cfg.get("should_transfer_files", True) else str
 
     plan = DagPlan(basename)
 
@@ -460,6 +526,7 @@ def build_plan(cfg, user_tag=None):
         ninj = block["injections_per_job"]
         inj_file = block["injection_file"]
         approx = block["approximant"]
+        tidal_cfg = block.get("tidal", cfg.get("tidal"))
 
         banks_used_block = block.get("banks", banks_used)
 
@@ -479,8 +546,8 @@ def build_plan(cfg, user_tag=None):
             bank_entry = bank_table[bank_name]
             bank_path = bank_entry["path"]
             bank_approx = bank_entry.get("approximant")
-            template_bank_arg = ("%s:%s" % (bank_path, bank_approx)
-                                  if bank_approx else bank_path)
+            template_bank_arg = ("%s:%s" % (job_path(bank_path), bank_approx)
+                                  if bank_approx else job_path(bank_path))
             # P1 (NB-1): per-bank flow override, user-specified as data --
             # falls back to the global psd.flow when a bank doesn't set its
             # own (validate_schema already guarantees one of the two exists
@@ -502,16 +569,18 @@ def build_plan(cfg, user_tag=None):
             if psd_cfg.get("reference_psd"):
                 static_inputs.append(psd_cfg["reference_psd"])
             _condor_transfer_cmds(sub, condor_cfg, static_inputs)
+            sub.add_cmd("transfer_output_files", "$(tag).h5")
             _condor_container_cmds(sub, condor_cfg)
+            _condor_extra_cmds(sub, condor_cfg)
 
-            sub.add_opt("injection-file", inj_file)
+            sub.add_opt("injection-file", job_path(inj_file))
             sub.add_opt("injection-approx", approx)
             sub.add_opt("injection-min", "$(injmin)")
             sub.add_opt("injection-max", "$(injmax)")
             sub.add_opt("user-tag", "$(tag)")
             sub.add_opt("template-bank", template_bank_arg)
             if psd_cfg.get("reference_psd"):
-                sub.add_opt("reference-psd", psd_cfg["reference_psd"])
+                sub.add_opt("reference-psd", job_path(psd_cfg["reference_psd"]))
                 sub.add_opt("instrument", psd_cfg["instrument"])
             elif psd_cfg.get("noise_model"):
                 sub.add_opt("noise-model", psd_cfg["noise_model"])
@@ -524,6 +593,10 @@ def build_plan(cfg, user_tag=None):
             if ecc_cfg:
                 sub.add_opt("ecc-columns", ecc_cfg.get("ecc_columns", "alpha2:alpha3"))
                 sub.add_opt("ecc-f-ref", ecc_cfg.get("ecc_f_ref", 20.0))
+            for extra_args in (cfg.get("sbank_sim", {}).get("extra_args", []),
+                               bank_entry.get("extra_args", []), block.get("extra_args", [])):
+                for arg in extra_args:
+                    sub.add_arg(arg)
 
             bank_node_names = []
             for j in range(njobs):

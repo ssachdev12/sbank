@@ -120,6 +120,10 @@ def parse_command_line():
     parser.add_option("--user-tag",default="banksim")
     parser.add_option("--injection-file",default = None)
     parser.add_option("--injection-approx",default = None)
+    parser.add_option("--injection-f-ref", type="float", default=None,
+        help="reference frequency for the injection spins; default = flow")
+    parser.add_option("--skip-waveform-errors", action="store_true", default=False,
+        help="skip injections raising ValueError or RuntimeError and record NaN matches")
     parser.add_option("--injection-min", default = 0, type="int", metavar="N", help="Skip first N injections. This cut is applied after all other filters on the injection file are applied.")
     parser.add_option("--injection-max", default = -1, type="int", metavar="M", help="Skip all injections after the Mth injection. This cut is applied after all other filters on the injection file are applied.")
 
@@ -297,21 +301,33 @@ if verbose:
 # main worker loop
 # FIXME: this (potentially) breaks using mixed template bank approximants
 match_map = np.empty(len(sims), dtype=[("match", np.float32), ("inj_sigmasq", np.float32)])
+inj_status = np.zeros(len(sims), dtype=np.int8)
 inj_bank = Bank(noise_model, flow, fhigh_max=opts.fhigh_max,
                 tidal_lambda_columns=tuple(opts.tidal_lambda_columns.split(":")),
                 tidal_ffinal_mode=opts.tidal_ffinal_mode,
-                ecc_columns=tuple(opts.ecc_columns.split(":")), ecc_f_ref=opts.ecc_f_ref)
+                ecc_columns=tuple(opts.ecc_columns.split(":")), ecc_f_ref=opts.ecc_f_ref,
+                inj_f_ref=opts.injection_f_ref)
 tmplts = lsctables.SnglInspiralTable()
 for j, sim in enumerate(sims):
 
-    inj_wf = inj_approx.from_sim(sim, bank=inj_bank)
     inj_ind = opts.injection_min + j
-    if verbose:
-        print("injection %d/%d" % (j+1, len(sims)))
-        print(inj_format % inj_wf.params)
+    try:
+        inj_wf = inj_approx.from_sim(sim, bank=inj_bank)
+        if verbose:
+            print("injection %d/%d" % (j+1, len(sims)))
+            print(inj_format % inj_wf.params)
 
-    # NB: sigmasq set during argmax_match
-    match_tup = bank.argmax_match(inj_wf)
+        # NB: sigmasq set during argmax_match
+        match_tup = bank.argmax_match(inj_wf)
+    except (ValueError, RuntimeError) as exc:
+        if not opts.skip_waveform_errors:
+            raise
+        print("Skipping injection %d: %s" % (inj_ind, exc), file=sys.stderr)
+        match_map[j] = (np.nan, np.nan)
+        inj_status[j] = 1
+        # A placeholder preserves alignment with sim_inspiral and match_map.
+        tmplts.append(bank._templates[0].to_sngl())
+        continue
 
     if verbose:
         print("\tbest matching template:  ", end=' ')
@@ -347,6 +363,7 @@ if inj_approx.is_eccentric:
     h5file.attrs["ecc_f_ref"] = np.float32(opts.ecc_f_ref)
 h5file.create_dataset("/sngl_inspiral", data=ligolw_table_to_array_tmplts(tmplts), compression='gzip', compression_opts=1)
 h5file.create_dataset("/match_map", data=match_map, compression='gzip', compression_opts=1)
+h5file.create_dataset("/inj_status", data=inj_status, compression='gzip', compression_opts=1)
 h5file.flush()
 
 # merge process and process_params tables, then complete ourselves

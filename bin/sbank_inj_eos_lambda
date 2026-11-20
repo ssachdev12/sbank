@@ -1,0 +1,272 @@
+#!/usr/bin/env python
+"""What: Write or verify EOS tidal deformabilities in injection tables.
+
+Inputs: LIGO_LW sim_inspiral XML(.gz); verification also accepts banksim HDF5.
+Outputs: XML(.gz) with Lambda1/Lambda2 and process provenance, or a verification
+report on stdout (status 0 for agreement, 1 for unsupported masses/mismatches).
+Usage: sbank_inj_eos_lambda --input IN.xml.gz --output OUT.xml.gz --eos NAME
+       sbank_inj_eos_lambda --input OUT.xml.gz --eos NAME --verify
+
+Masses are in solar masses, as stored, without a redshift correction.
+"""
+
+import argparse
+import hashlib
+import io
+import sys
+from unittest.mock import patch
+
+import lal
+import lalsimulation as lalsim
+import numpy as np
+from igwn_ligolw import ligolw, lsctables, utils
+
+
+PROGRAM = "sbank_inj_eos_lambda"
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--input", required=True)
+    parser.add_argument("--output", help="required for writing; omitted with --verify")
+    parser.add_argument("--eos", required=True, help="recognised LAL EOS name")
+    parser.add_argument("--lambda-columns", default="alpha:alpha1", metavar="COL1:COL2")
+    parser.add_argument("--mmin", type=float, help="additional lower mass cut (solar masses); "
+                        "fallback lower support if the LAL minimum-mass binding is absent")
+    parser.add_argument("--mmax", type=float, help="additional upper mass cut (solar masses)")
+    parser.add_argument("--keep-outside", action="store_true",
+                        help="keep unsupported rows, setting only unsupported components to zero")
+    parser.add_argument("--verify", action="store_true", help="read-only comparison with direct LAL values")
+    parser.add_argument("--tolerance", type=float, default=1e-3)
+    parser.add_argument("--h5-table", default="sim_inspiral", help="HDF5 compound dataset or column group")
+    args = parser.parse_args()
+    if args.verify == bool(args.output):
+        parser.error("supply --output when writing, or --verify without --output")
+    columns = args.lambda_columns.split(":")
+    if (len(columns) != 2 or columns[0] == columns[1] or
+            any(lsctables.SimInspiralTable.validcolumns.get(c) not in ("real_4", "real_8")
+                for c in columns) or any(c in ("mass1", "mass2", "mchirp", "eta") for c in columns)):
+        parser.error("--lambda-columns requires two distinct real sim_inspiral columns "
+                     "other than mass1, mass2, mchirp, eta")
+    for name in ("mmin", "mmax", "tolerance"):
+        value = getattr(args, name)
+        if value is not None and (not np.isfinite(value) or value < 0):
+            parser.error("--%s must be finite and nonnegative" % name)
+    return args, columns
+
+
+class EOS:
+    def __init__(self, args):
+        try:
+            eos = lalsim.SimNeutronStarEOSByName(args.eos)
+        except (RuntimeError, ValueError) as exc:
+            names = ", ".join(str(n) for n in lalsim.SimNeutronStarEOSNames)
+            raise ValueError("unrecognised EOS %r; recognised names: %s" % (args.eos, names)) from exc
+        self.family = lalsim.CreateSimNeutronStarFamily(eos)
+        self.maximum = lalsim.SimNeutronStarMaximumMass(self.family) / lal.MSUN_SI
+        minimum_fn = getattr(lalsim, "SimNeutronStarFamMinimumMass", None)
+        self.minimum = minimum_fn(self.family) / lal.MSUN_SI if minimum_fn else (args.mmin or 0.)
+        if minimum_fn is None:
+            print("LAL minimum-mass binding unavailable: falling back to Mmin=%g "
+                  "(--mmin or 0)." % self.minimum, file=sys.stderr)
+        self.lower = max(self.minimum, args.mmin if args.mmin is not None else self.minimum)
+        self.upper = min(self.maximum, args.mmax if args.mmax is not None else self.maximum)
+        if self.lower > self.upper:
+            raise ValueError("empty mass interval after intersecting --mmin/--mmax with EOS support")
+        print("EOS %s: Mmin=%.12g Mmax=%.12g Msun; effective support [%.12g, %.12g]" %
+              (args.eos, self.minimum, self.maximum, self.lower, self.upper))
+
+    def supported(self, masses):
+        return np.isfinite(masses) & (masses > 0) & (masses >= self.lower) & (masses <= self.upper)
+
+    def direct(self, mass):
+        mass_si = float(mass) * lal.MSUN_SI
+        radius = lalsim.SimNeutronStarRadius(mass_si, self.family)
+        k2 = lalsim.SimNeutronStarLoveNumberK2(mass_si, self.family)
+        compactness = lal.G_SI * mass_si / (radius * lal.C_SI**2)
+        value = (2. / 3.) * k2 / compactness**5
+        if not np.isfinite(value) or value <= 0:
+            raise ValueError("invalid LAL Lambda at mass %.12g" % mass)
+        return value
+
+    def evaluate(self, masses):
+        values = np.zeros(masses.shape)
+        valid = self.supported(masses)
+        # Family radius/k2 calls use LAL's existing splines and are already fast.
+        values[valid] = np.fromiter((self.direct(m) for m in masses[valid]),
+                                    dtype=float, count=int(valid.sum()))
+        return values
+
+    def reference_summary(self):
+        for mass in (0.5, 1.1, 1.4):
+            value = "%.8g" % self.direct(mass) if self.minimum <= mass <= self.maximum else "outside EOS support"
+            print("Lambda(%.1f Msun) = %s" % (mass, value))
+
+
+def load_xml(filename):
+    try:
+        return utils.load_filename(filename)
+    except Exception as exc:
+        if "ilwd:char" not in str(exc):
+            raise
+        print("Old ilwd:char IDs detected; converting in memory with igwn_ligolw. "
+              "If conversion fails, run igwn_ligolw_no_ilwdchar on a copy.", file=sys.stderr)
+        try:
+            from igwn_ligolw.utils.ilwd import strip_ilwdchar
+            # This is the conversion used by igwn_ligolw_no_ilwdchar itself.
+            with patch.dict(ligolw.Table.TableByName, clear=True):
+                generic = utils.load_filename(filename)
+            strip_ilwdchar(generic)
+            buffer = io.BytesIO()
+            utils.write_fileobj(generic, buffer)
+            generic.unlink()
+            buffer.seek(0)
+            return utils.load_fileobj(buffer)
+        except Exception as conversion_error:
+            raise ValueError("ilwd:char conversion failed; run igwn_ligolw_no_ilwdchar "
+                             "on a copy of the input: %s" % conversion_error) from conversion_error
+
+
+def read_verify_input(args, columns):
+    import h5py
+    fields = ("mass1", "mass2", *columns)
+    if h5py.is_hdf5(args.input):
+        with h5py.File(args.input, "r") as handle:
+            table = handle[args.h5_table]
+            available = table.dtype.names if isinstance(table, h5py.Dataset) else table.keys()
+            if available is None or any(f not in available for f in fields):
+                raise ValueError("HDF5 table must contain fields %s" % (fields,))
+            arrays = [np.asarray(table[f], dtype=float) for f in fields]
+            ids = np.asarray(table["simulation_id"]) if "simulation_id" in available else np.arange(len(arrays[0]))
+    else:
+        doc = load_xml(args.input)
+        table = lsctables.SimInspiralTable.get_table(doc)
+        for field in fields:
+            table.getColumnByName(field)  # fail clearly for missing transport columns
+        arrays = [np.asarray([getattr(row, field) for row in table], dtype=float) for field in fields]
+        ids = np.asarray([getattr(row, "simulation_id", i) for i, row in enumerate(table)])
+        doc.unlink()
+    if any(a.ndim != 1 or len(a) != len(ids) for a in arrays):
+        raise ValueError("table fields must be one-dimensional with equal lengths")
+    return np.column_stack(arrays[:2]), np.column_stack(arrays[2:]), ids
+
+
+def deviations(stored, expected):
+    relative = np.full(expected.shape, np.inf)
+    valid = (expected > 0) & np.isfinite(stored)
+    relative[valid] = np.abs(stored[valid] - expected[valid]) / expected[valid]
+    return relative
+
+
+def verify(args, columns, eos):
+    masses, stored, ids = read_verify_input(args, columns)
+    supported = eos.supported(masses)
+    expected = eos.evaluate(masses)
+    relative = deviations(stored, expected)
+    eligible = expected > 0
+    outside = ~supported.all(axis=1)
+    bad = outside | ((relative > args.tolerance) & eligible).any(axis=1)
+    maximum = np.max(relative[eligible]) if eligible.any() else 0.
+    median = np.median(relative[eligible]) if eligible.any() else 0.
+    print("n rows: %d; rows outside support: %d" % (len(masses), outside.sum()))
+    print("Rows with stored Lambda == 0: %d; NaN: %d; nonfinite: %d" %
+          ((stored == 0).any(axis=1).sum(), np.isnan(stored).any(axis=1).sum(),
+           (~np.isfinite(stored)).any(axis=1).sum()))
+    print("Relative deviation over components with recomputed Lambda > 0: max=%.9g median=%.9g" %
+          (maximum, median))
+
+    def show_row(i):
+        print("  row %d simulation_id=%s mass1=%.9g mass2=%.9g "
+              "stored=(%.9g, %.9g) recomputed=(%.9g, %.9g) rel=(%.6g, %.6g)%s" %
+              (i, ids[i], *masses[i], *stored[i], *expected[i], *relative[i],
+               " OUTSIDE SUPPORT" if outside[i] else ""))
+
+    if outside.any():
+        print("Worst outside-support rows (up to 5):")
+        distance = np.max(np.maximum(eos.lower - masses, masses - eos.upper), axis=1)
+        distance[~np.isfinite(distance)] = np.inf
+        indices = np.flatnonzero(outside)
+        for i in indices[np.argsort(distance[indices])[::-1][:5]]:
+            show_row(i)
+    print("Deviation by mass bin (components with recomputed Lambda > 0):")
+    print("  mass_low mass_high n_components max_relative median_relative")
+    edges = np.linspace(eos.lower, eos.upper, 9)
+    for j, (low, high) in enumerate(zip(edges[:-1], edges[1:])):
+        mask = eligible & (masses >= low) & ((masses <= high) if j == 7 else (masses < high))
+        values = relative[mask]
+        print("  %.6g %.6g %d %.9g %.9g" %
+              (low, high, len(values), np.max(values) if len(values) else np.nan,
+               np.median(values) if len(values) else np.nan))
+    if bad.any():
+        print("Offending rows (first 20; row indices are zero-based):")
+        for i in np.flatnonzero(bad)[:20]:
+            show_row(i)
+        mask = eligible & np.isfinite(stored)
+        if mask.any():
+            x, y = expected[mask], stored[mask]
+            factor = np.dot(x, y) / np.dot(x, x)
+            residual = np.max(np.abs(y - factor*x) / x)
+            print("Best-fit constant factor (stored = factor * recomputed): %.9g; "
+                  "max residual / recomputed=%.9g; consistent factor: %s" %
+                  (factor, residual, "yes" if residual <= args.tolerance else "no"))
+        swapped = expected[:, ::-1]
+        swap_mask = swapped > 0
+        swap_relative = deviations(stored, swapped)[swap_mask]
+        if len(swap_relative):
+            swap_max = np.max(swap_relative)
+            print("Swapped mass2/mass1 comparison: max=%.9g median=%.9g; matches: %s" %
+                  (swap_max, np.median(swap_relative),
+                   "yes" if not outside.any() and swap_max <= args.tolerance else "no"))
+    print("Verification %s (tolerance %.9g)" % ("FAILED" if bad.any() else "PASSED", args.tolerance))
+    return int(bad.any())
+
+
+def write(args, columns, eos):
+    with open(args.input, "rb") as source:
+        digest = hashlib.file_digest(source, "md5").hexdigest()
+    doc = load_xml(args.input)
+    table = lsctables.SimInspiralTable.get_table(doc)
+    masses = np.asarray([(row.mass1, row.mass2) for row in table], dtype=float).reshape(-1, 2)
+    supported = eos.supported(masses)
+    outside = ~supported.all(axis=1)
+    keep = np.ones(len(table), dtype=bool) if args.keep_outside else ~outside
+    values = eos.evaluate(masses[keep])
+    for col in columns:
+        if col not in table.columnnames:
+            table.appendColumn(col)
+    table[:] = [row for row, kept in zip(table, keep) if kept]
+    for row, lambdas in zip(table, values):
+        for col, value in zip(columns, lambdas):
+            setattr(row, col, float(value))
+    n_in, n_kept = len(masses), len(table)
+    params = dict(vars(args), input_md5=digest, lalsimulation_version=lalsim.__version__,
+                  eos_mmin=eos.minimum, eos_mmax=eos.maximum, effective_mmin=eos.lower,
+                  effective_mmax=eos.upper, n_in=n_in, n_kept=n_kept,
+                  n_dropped=n_in-n_kept, n_outside=int(outside.sum()))
+    # register_process records both boolean values as flag presence; retain their
+    # actual values as strings so the provenance is unambiguous.
+    params = {k: str(v).lower() if isinstance(v, bool) else v for k, v in params.items()}
+    process = doc.register_process(PROGRAM, params, version=lalsim.__version__)
+    process.set_end_time_now()
+    utils.write_filename(doc, args.output)
+    doc.unlink()
+    print("n_in=%d n_kept=%d (n_total) n_dropped=%d; rows outside support=%d; "
+          "unsupported components set to zero=%d" %
+          (n_in, n_kept, n_in-n_kept, outside.sum(), (~supported).sum() if args.keep_outside else 0))
+    return 0
+
+
+def main():
+    args, columns = parse_args()
+    try:
+        eos = EOS(args)
+        eos.reference_summary()
+        return verify(args, columns, eos) if args.verify else write(args, columns, eos)
+    except (OSError, ValueError, KeyError, RuntimeError) as exc:
+        print("%s: %s" % (PROGRAM, exc), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

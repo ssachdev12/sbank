@@ -50,7 +50,7 @@ class Bank(object):
                  nhood_param="tau0", coarse_match_df=None, iterative_match_df_max=None,
                  fhigh_max=None, optimize_flow=None, tidal_lambda_columns=("alpha", "alpha1"),
                  tidal_ffinal_mode="disruption", ecc_columns=("alpha2", "alpha3"),
-                 ecc_f_ref=20.):
+                 ecc_f_ref=20., inj_f_ref=None):
         self.noise_model = noise_model
         self.flow = flow
         self.use_metric = use_metric
@@ -62,6 +62,7 @@ class Bank(object):
         self.tidal_ffinal_mode = tidal_ffinal_mode
         self.ecc_columns = ecc_columns
         self.ecc_f_ref = ecc_f_ref
+        self.inj_f_ref = inj_f_ref
 
         if (
             self.coarse_match_df

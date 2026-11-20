@@ -54,15 +54,18 @@ injections:
 banks:
   allsky:
     path: "{{BANK_PATH_ALLSKY}}"
+    approximant: TaylorF2   # required for XML banks: sbank_sim has no per-template fallback
     flow: 15.0   # GstLAL O4 stellar/allsky match-integral f_low convention (F4 section 1.2)
   ssm:
     path: "{{BANK_PATH_SSM}}"
+    approximant: TaylorF2   # required for XML banks: sbank_sim has no per-template fallback
     tag: SSM     # historical campaign directory/tag casing (WP7 NB-2)
     flow: 45.0   # GstLAL O4 SSM match-integral f_low convention (F4 section 1.2);
                  # per-bank override so this leg no longer inherits allsky's 15 Hz
                  # (WP7 NB-1 fix).
   all:
     path: "{{BANK_PATH_ALL}}"
+    approximant: TaylorF2   # required for XML banks: sbank_sim has no per-template fallback
     tag: ALL     # historical campaign directory/tag casing (WP7 NB-2)
     # No per-bank flow override -- falls back to the global psd.flow below; see
     # r1's banks.all note (same open item: combined-bank f_low convention).

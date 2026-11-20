@@ -57,7 +57,8 @@ injections:
 banks:
   allsky:
     path: "{{BANK_PATH_ALLSKY}}"
-    # BBH-region stellar bank uses IMR templates per its own approximant column;
+    approximant: "{{BANK_APPROX_ALLSKY}}"   # required for XML banks (sbank_sim has no per-template
+                 # fallback); set with --set to the template model of the bank in use
     # leave unset here (see R5 template's note for the same rationale).
 
 psd:

@@ -366,3 +366,57 @@ consolidator-contract schema (`sim_inspiral`/`sngl_inspiral`/`match_map`/`proces
 datasets exactly where the injection approximant's `is_tidal`/`is_eccentric` flags say
 they should appear), and finite matches in (0, 1]. Full verbatim output is in
 `.claude-wp/WP8_report.md`.
+
+## WP9 campaign tooling (2026-11)
+
+`bin/sbank_sim_dag_config` now prepares transfer-mode jobs for the IGWN pool:
+the default executable is `/opt/conda/envs/sbank-igwn/bin/sbank_sim` inside the
+container, `transfer_executable = false`, full input paths/OSDF URLs are staged
+while arguments use basenames, each initialdir and its `logs/` are created, and
+only `$(tag).h5` is returned. Shared-filesystem mode keeps full argument paths.
+Non-HDF banks require an explicit approximant. Raw `condor.extra_submit` lines,
+optional string `condor.getenv` (absent by default), and global/bank/injection
+`extra_args` are supported; NOILWD and PLOT default off. Per-injection `tidal`
+overrides the campaign block, with `tidal: null` disabling tidal options for BBH.
+Container image directives and the `--allow-placeholders`, `--set`, and
+`--user-tag` CLI remain available. These are generation checks; no live IGWN
+submission has been performed.
+
+- `configs/dd2_subsolar.yaml`: DD2 subsolar TaylorF2Tidal injections, explicit
+  ISCO cutoff and alpha/alpha1 lambdas, and a `SUBSOLAR_CUT_ARGS` placeholder.
+- `configs/dd2_bns.yaml`: DD2 BNS TaylorF2Tidal injections; the ALL bank leg uses
+  15 Hz (the other new configs use 45 Hz for ALL).
+- `configs/lvk_ssm_release_aligned.yaml`: separate tidal BNS and TaylorF2 BBH
+  blocks; alpha4 preserves the release row index and BBH disables tidal options.
+- `configs/lvk_ssm_release_precessing.yaml`: IMRPhenomXP_NRTidalv3 BNS with
+  `--injection-f-ref 30 --skip-waveform-errors`, and IMRPhenomXPHM BBH with
+  `--injection-f-ref 30`; alpha4 preserves the release row index. All four
+  templates use explicit TaylorF2 banks, neighborhood size 1 in tau0, and
+  placeholders for production inputs/resources. Their integer count defaults
+  (100000 injections / 5000 jobs / 20 per job) **must be reset to the final
+  selected or post-EOS-cut count** before submission. ISCO matches the ALF2-era
+  runs; this fork uses LAL's default PN order and has no `--template-pn-order`.
+- `bin/sbank_inj_eos_lambda`: writes tidal deformabilities from a named lalsimulation
+  equation of state (e.g. `GPPVA_DD2_BSK24`, `ALF2`) into a sim_inspiral XML's
+  `alpha`/`alpha1` columns (Lambda = 2/3 k2 / C^5 from `SimNeutronStarRadius` and
+  `SimNeutronStarLoveNumberK2`), drops rows with a component mass outside the EOS's
+  stable range (or zeroes them with `--keep-outside`), records input md5, EOS limits
+  and counts in process_params, and prints the kept count (the DAG `n_total`).
+  `--verify` recomputes Lambda for an existing XML or a banksim `.h5` and exits 1 on
+  masses outside support or deviations above `--tolerance` (default 1e-3), with
+  constant-factor and swapped-component diagnostics. 100k rows: about 2 s.
+- `bin/sbank_inj_from_lvk_release`: converts an LVK search-sensitivity injection HDF5
+  (`events` compound dataset, O4a sub-solar release) to a sim_inspiral XML for
+  `sbank_sim`: detector-frame masses by default, `--spin-mode aligned|precessing`,
+  release Lambdas into `alpha`/`alpha1`, eccentricity into `alpha2`, the release row
+  index into `alpha4`, optimal network SNR into `alpha5`; right ascension,
+  declination, polarisation and time are folded into sbank's detector-frame
+  polarisation angle (latitude pi/2, longitude 0, psi = atan2(Fc, Fp)/2 from the
+  detector's antenna response). `--index-csv` writes a row map. 300k rows: about
+  7 s, 0.75 GB.
+- `IMRPhenomXP_NRTidalv3` is registered as an injection/template class (kappa2T >
+  6e4 rejected, an sbank safety choice). `sbank_sim --injection-f-ref HZ` sets the
+  spin reference frequency for the injection bank only (default: flow, unchanged
+  behaviour). `sbank_sim --skip-waveform-errors` continues past per-injection LAL
+  failures, writing NaN matches and a 1 in the new `/inj_status` int8 dataset (always
+  written, zeros otherwise). Tests: `.claude-wp/tests/WP9_{dag,eos,lvk,wave}_test.py`.
